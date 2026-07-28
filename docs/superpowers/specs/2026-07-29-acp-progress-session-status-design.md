@@ -4,7 +4,7 @@
 
 将 `acp_progress` 从“必须指定 turn 的进度查询”扩展为 Hermes 可随时调用的会话状态查询。
 
-Hermes 只需持有 `session_id`，即可判断当前对话是否就绪、正在执行、等待权限、已经完成或已经中断；需要防止误查旧 turn 时，仍可额外传入 `turn_id` 做精确校验。
+Hermes 只需持有 `session_id`，即可判断当前对话是否空闲、正在执行、等待权限、已经完成或已经中断；需要防止误查旧 turn 时，仍可额外传入 `turn_id` 做精确校验。
 
 本设计替代 `2026-07-29-hermes-session-turn-contract-design.md` 中“`acp_progress` 必须携带 `turn_id`”的约定；其他会话和 turn 契约保持不变。
 
@@ -34,7 +34,7 @@ Hermes 只需持有 `session_id`，即可判断当前对话是否就绪、正在
 处理规则：
 
 1. Session 不存在时返回 `session not found`；
-2. Session 没有 turn 时返回 `ready`；
+2. Session 没有 turn 时返回 `idle`；
 3. Session 有 turn 时返回该 turn 的当前或最终状态。
 
 ### 同时传 session_id 和 turn_id
@@ -61,23 +61,23 @@ Hermes 只需持有 `session_id`，即可判断当前对话是否就绪、正在
 
 | status | 含义 | 关键字段 | Hermes 下一步 |
 |---|---|---|---|
-| `ready` | Session 存在，但尚无当前或最近 turn | `session_id`、`state: idle`、可选 `title` | 可以调用 `acp_chat` |
+| `idle` | Session 存在，但尚无当前或最近 turn | `session_id`、`state: idle`、可选 `title` | 可以调用 `acp_chat` |
 | `running` | 当前 turn 正在执行 | `session_id`、`turn_id`、累计进度 | 稍后继续查询，必要时中断 |
 | `permission_required` | 当前 turn 等待权限回复 | `session_id`、`turn_id`、`request_id`、`permission` | 调用 `acp_respond` |
 | `completed` | 最近 turn 已完成 | `session_id`、`turn_id`、最终结构化结果 | 继续下一轮或关闭 |
 | `interrupted` | 最近 turn 已中断 | `session_id`、`turn_id`、中断前快照 | 继续下一轮或关闭 |
 
-`ready` 不返回 `turn_id`。其他正常状态均返回实际的 `turn_id`。
+`idle` 不返回 `turn_id`。其他正常状态均返回实际的 `turn_id`。
 
-Prompt 自身执行失败继续作为 MCP 工具错误返回，不转换为 `ready`。
+Prompt 自身执行失败继续作为 MCP 工具错误返回，不转换为 `idle`。
 
-## ready 返回
+## idle 返回
 
 Session 存在但 `Server.turns` 中没有对应 turn 时：
 
 ```json
 {
-  "status": "ready",
+  "status": "idle",
   "session_id": "s-1",
   "state": "idle"
 }
@@ -127,15 +127,15 @@ acp_progress(session_id: "s-1", turn_id: "t-1")
 - agent client 不可用：`agent client unavailable`；
 - Prompt 执行失败：保留原有工具错误。
 
-上述错误均使用 MCP `IsError: true`。`ready` 是正常状态，使用 `IsError: false`。
+上述错误均使用 MCP `IsError: true`。`idle` 是正常状态，使用 `IsError: false`。
 
 ## 测试
 
 ### Session 级查询
 
-1. 只传 `session_id`，无 turn 时返回 `ready`；
-2. `ready` 返回 `state: idle`，不返回 `turn_id`；
-3. 有真实标题时 `ready` 返回 `title`，无标题时省略；
+1. 只传 `session_id`，无 turn 时返回 `idle`；
+2. `idle` 返回 `state: idle`，不返回 `turn_id`；
+3. 有真实标题时 `idle` 返回 `title`，无标题时省略；
 4. 只传 `session_id` 可查询 `running`；
 5. 只传 `session_id` 可查询 `permission_required`；
 6. 只传 `session_id` 可重复查询 `completed`；
@@ -160,7 +160,7 @@ acp_progress(session_id: "s-1", turn_id: "t-1")
 本次修改：
 
 - 调整 `acp_progress` 参数 schema；
-- 增加 `ready` 正常结果；
+- 增加 `idle` 正常结果；
 - 调整 handler 的 turn 校验分支；
 - 更新内嵌 skill、`DESIGN.md` 和对应测试。
 
