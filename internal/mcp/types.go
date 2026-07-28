@@ -33,7 +33,7 @@ type acpSetConfigArgs struct {
 }
 
 type acpListHistoryArgs struct {
-	CWD string `json:"cwd,omitempty" jsonschema:"Working directory to scope the search"`
+	AgentType string `json:"agent_type,omitempty" jsonschema:"Agent type: codex, claude, gemini, or opencode (default: codex)"`
 }
 
 type acpTurnArgs struct {
@@ -41,17 +41,18 @@ type acpTurnArgs struct {
 	TurnID    string `json:"turn_id" jsonschema:"The turn ID returned by acp_chat"`
 }
 
-type acpProgressArgs = acpTurnArgs
+type acpProgressArgs struct {
+	SessionID string `json:"session_id" jsonschema:"The qualified session ID"`
+	TurnID    string `json:"turn_id,omitempty" jsonschema:"Optional turn ID for exact-match validation"`
+}
 
 type acpLoadSessionArgs struct {
-	SessionID string `json:"session_id" jsonschema:"The persisted session ID to load"`
-	AgentType string `json:"agent_type,omitempty" jsonschema:"Agent type: codex, claude, gemini, or opencode (default: codex)"`
+	SessionID string `json:"session_id" jsonschema:"Qualified persisted session ID in <agent_type>:<agent_session_id> form"`
 	CWD       string `json:"cwd,omitempty" jsonschema:"Working directory for the loaded session"`
 }
 
 type acpDeleteSessionArgs struct {
-	SessionID string `json:"session_id" jsonschema:"The persisted session ID to delete"`
-	AgentType string `json:"agent_type,omitempty" jsonschema:"Agent type: codex, claude, gemini, or opencode (default: codex)"`
+	SessionID string `json:"session_id" jsonschema:"Qualified persisted session ID in <agent_type>:<agent_session_id> form"`
 }
 
 // ---------------------------------------------------------------------------
@@ -110,10 +111,11 @@ type permissionOption struct {
 }
 
 type sessionListItem struct {
-	ID          string `json:"id"`
+	SessionID   string `json:"session_id"`
 	AgentType   string `json:"agent_type,omitempty"`
 	State       string `json:"state,omitempty"`
 	Status      string `json:"status,omitempty"`
+	TurnStatus  string `json:"turn_status,omitempty"`
 	TurnCount   int    `json:"turn_count,omitempty"`
 	IdleSeconds int    `json:"idle_seconds,omitempty"`
 	Title       string `json:"title,omitempty"`

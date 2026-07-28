@@ -555,8 +555,8 @@ func TestNewReturnsErrorOnNonRespondingAgent(t *testing.T) {
 
 // mockAgent implements acp.Agent for end-to-end testing.
 type mockAgent struct {
-	newSessionID string
-	promptCh     chan acp.PromptRequest
+	returnedSessionID string
+	promptCh          chan acp.PromptRequest
 }
 
 func (m *mockAgent) Initialize(_ context.Context, _ acp.InitializeRequest) (acp.InitializeResponse, error) {
@@ -564,7 +564,7 @@ func (m *mockAgent) Initialize(_ context.Context, _ acp.InitializeRequest) (acp.
 }
 
 func (m *mockAgent) NewSession(_ context.Context, _ acp.NewSessionRequest) (acp.NewSessionResponse, error) {
-	return acp.NewSessionResponse{SessionId: acp.SessionId(m.newSessionID)}, nil
+	return acp.NewSessionResponse{SessionId: acp.SessionId(m.returnedSessionID)}, nil
 }
 
 func (m *mockAgent) LoadSession(_ context.Context, _ acp.LoadSessionRequest) (acp.LoadSessionResponse, error) {
@@ -614,8 +614,8 @@ var _ acp.Agent = (*mockAgent)(nil)
 func TestEndToEndNewSessionAndPrompt(t *testing.T) {
 	const wantSessionID = "e2e-session-1"
 	agent := &mockAgent{
-		newSessionID: wantSessionID,
-		promptCh:     make(chan acp.PromptRequest, 1),
+		returnedSessionID: wantSessionID,
+		promptCh:          make(chan acp.PromptRequest, 1),
 	}
 
 	drv := &mockDriver{
@@ -677,12 +677,17 @@ func TestEndToEndNewSessionAndPrompt(t *testing.T) {
 // permissionAgent 在 Prompt 期间主动发起 RequestPermission。
 type permissionAgent struct {
 	mockAgent
-	conn *acp.AgentSideConnection
+	conn      *acp.AgentSideConnection
+	connReady chan struct{}
 }
 
-func (a *permissionAgent) SetAgentConnection(c *acp.AgentSideConnection) { a.conn = c }
+func (a *permissionAgent) SetAgentConnection(c *acp.AgentSideConnection) {
+	a.conn = c
+	close(a.connReady)
+}
 
 func (a *permissionAgent) Prompt(ctx context.Context, p acp.PromptRequest) (acp.PromptResponse, error) {
+	<-a.connReady
 	// 向 client 发起权限请求
 	_, err := a.conn.RequestPermission(ctx, acp.RequestPermissionRequest{
 		SessionId: p.SessionId,
@@ -705,7 +710,8 @@ func strPtr(s string) *string { return &s }
 
 func TestE2EPermissionRoundTrip(t *testing.T) {
 	agent := &permissionAgent{
-		mockAgent: mockAgent{newSessionID: "perm-session"},
+		mockAgent: mockAgent{returnedSessionID: "perm-session"},
+		connReady: make(chan struct{}),
 	}
 
 	drv := &mockDriver{

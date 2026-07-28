@@ -27,7 +27,7 @@ acp-bridge 暴露 14 个 MCP 工具（`acp_*` 前缀），用于将编码任务�
 |------|------|------|
 | `acp_chat` | prompt, session_id?, cwd?, agent_type? | 发送 prompt，等待结果 |
 | `acp_respond` | session_id, request_id, outcome | 回复权限请求（allow/deny） |
-| `acp_progress` | session_id, turn_id | 检查当前 turn，返回可重复查询的状态快照 |
+| `acp_progress` | session_id, turn_id? | 查询当前或最近 turn；无 turn 时返回 idle |
 | `acp_interrupt` | session_id, turn_id | 中断当前 turn（session 保持存活） |
 | `acp_close` | session_id | 关闭并释放 session |
 | `acp_sessions` | — | 列出活跃 session |
@@ -35,10 +35,10 @@ acp-bridge 暴露 14 个 MCP 工具（`acp_*` 前缀），用于将编码任务�
 | `acp_set_mode` | session_id, mode | 设置权限模式 |
 | `acp_set_config` | session_id, config_id, value | 设置配置项（model、reasoning_effort 等） |
 | `acp_fork_session` | session_id | 分支会话 |
-| `acp_load_session` | session_id, agent_type?, cwd? | 加载持久化会话 |
-| `acp_resume_session` | session_id | 恢复已关闭会话 |
-| `acp_list_history` | cwd? | 列出历史会话 |
-| `acp_delete_session` | session_id, agent_type? | 删除持久化会话 |
+| `acp_load_session` | session_id, cwd? | 加载持久化会话 |
+| `acp_resume_session` | session_id, cwd? | 恢复已关闭会话 |
+| `acp_list_history` | agent_type? | 列出指定 agent 的历史会话 |
+| `acp_delete_session` | session_id | 删除持久化会话 |
 
 默认值：`agent_type` 默认 `codex`，`cwd` 默认 `.`。
 
@@ -52,16 +52,16 @@ acp-bridge 暴露 14 个 MCP 工具（`acp_*` 前缀），用于将编码任务�
 
 **`running`** — 超时未完成，agent 仍在后台执行。返回已有进度快照（agent_text/reasoning/tool_calls/plan）+ session_id + turn_id。
 
-`acp_progress` 返回结构与 `acp_chat` 完全一致。`completed` 和 `interrupted` 会保留到同一 session 的下一次 `acp_chat`，期间可以使用相同的 `session_id + turn_id` 重复查询。
+`acp_progress` 返回结构与 `acp_chat` 完全一致。只传 `session_id` 时查询当前或最近 turn；额外传 `turn_id` 时执行精确校验。Session 尚无 turn 时返回 `idle`。`completed` 和 `interrupted` 会保留到同一 session 的下一次 `acp_chat`。
 
 ## Core Pattern: running 必须建 todo
 
 收到 `running` 时 **必须立即创建 todo**，否则会遗忘正在执行的 agent 任务：
 
 ```
-1. acp_chat → status: running, session_id: "s-1", turn_id: "t-1"
-2. 创建 todo: [s-1/t-1] <任务描述> — 调 acp_progress 取结果
-3. acp_progress(session_id: "s-1", turn_id: "t-1")
+1. acp_chat → status: running, session_id: "codex:thread-1", turn_id: "t-1"
+2. 创建 todo: [codex:thread-1/t-1] <任务描述> — 调 acp_progress 取结果
+3. acp_progress(session_id: "codex:thread-1", turn_id: "t-1")
    → completed:           读取结果，勾掉 todo
    → interrupted:         读取中断前快照，勾掉 todo
    → running:             继续等待，稍后再查
@@ -88,15 +88,15 @@ acp_respond(session_id, request_id: "tc-1", outcome: "allow"|"deny")
 
 ```
 1. acp_chat(prompt: "分析测试覆盖率", cwd: "/project")
-   → completed, session_id: "s-1"
-2. acp_chat(prompt: "为未覆盖分支添加测试", session_id: "s-1")
+   → completed, session_id: "codex:thread-1"
+2. acp_chat(prompt: "为未覆盖分支添加测试", session_id: "codex:thread-1")
    → completed
-3. acp_chat(prompt: "再跑一次确认", session_id: "s-1")
+3. acp_chat(prompt: "再跑一次确认", session_id: "codex:thread-1")
    → completed
-4. acp_close(session_id: "s-1")
+4. acp_close(session_id: "codex:thread-1")
 ```
 
-续会话只按 `session_id` 找回原会话；此时传入的 `agent_type` 和 `cwd` 会被忽略。`title` 是 agent 上报的可选输出元数据，不是 session 索引，也不作为任何对话工具的输入。
+`session_id` 固定采用 `<agent_type>:<agent_session_id>`，只切分第一个冒号，因此 agent 原始 ID 可以继续包含冒号。续会话只按该限定 ID 找回原会话；此时传入的 `agent_type` 和 `cwd` 会被忽略。
 
 同一 session 上不能并发发 prompt——如果 session 正在执行（状态为 prompting），再次调用 `acp_chat` 会返回 `session busy` 错误。需要先 `acp_interrupt(session_id, turn_id)`，或等 `acp_progress(session_id, turn_id)` 返回 completed。
 
@@ -110,14 +110,16 @@ acp_respond(session_id, request_id: "tc-1", outcome: "allow"|"deny")
 ## 资源清理
 
 - 任务完成后调 `acp_close` 释放 session
-- 空闲 session 会自动超时清理（默认 30 分钟（1800s）），但显式关闭更可靠
+- Session 不会因空闲或容量压力被自动淘汰，只在用户关闭、agent 实例退出或 bridge 退出时移除
+- 默认最多保留 10 个活跃 Session；达到上限后新建、加载、恢复和分支会被拒绝，已有 Session 不受影响
+- `acp_sessions()` 不分页，会返回当前全部活跃 Session
 - `acp_interrupt` 只中断匹配 `turn_id` 的当前 turn，session 保持存活可继续使用
 
 ## Common Mistakes
 
 | 错误 | 原因 | 解决 |
 |------|------|------|
-| session not found | ID 错误或已超时 | `acp_sessions` 查活跃列表 |
+| session not found | ID 错误、用户已关闭或对应 agent 已退出 | `acp_sessions` 查活跃列表 |
 | session busy | 已有 turn 在执行 | 先 `acp_interrupt` 或等 `acp_progress` |
 | turn mismatch | turn_id 不是当前 turn | 使用最近一次 `acp_chat` 返回的 turn_id |
 | waiting for permission | 处于权限等待 | 调 `acp_respond` 而非 `acp_chat` |

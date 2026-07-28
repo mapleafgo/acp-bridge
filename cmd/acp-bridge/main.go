@@ -1,17 +1,31 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/mapleafgo/acp-bridge/internal/config"
+	"github.com/mapleafgo/acp-bridge/internal/instance"
 	"github.com/mapleafgo/acp-bridge/internal/mcp"
-	"github.com/mapleafgo/acp-bridge/internal/session"
 )
 
-func main() {
+type lifecycleManager interface {
+	Close(context.Context) error
+}
+
+type runnableServer interface {
+	Run() error
+}
+
+func run() error {
 	cfg := config.Load()
+	if err := cfg.Validate(); err != nil {
+		return err
+	}
 
 	var h slog.Handler
 	switch strings.ToLower(cfg.LogFormat) {
@@ -22,8 +36,8 @@ func main() {
 	}
 	slog.SetDefault(slog.New(h))
 
-	pool := session.NewPool(cfg)
-	server := mcp.NewServer(cfg, pool)
+	manager := instance.NewManager(cfg, instance.DefaultFactory(cfg))
+	server := mcp.NewServer(cfg, manager)
 
 	slog.Info("acp-bridge starting",
 		"codex_path", cfg.CodexPath,
@@ -31,7 +45,18 @@ func main() {
 		"max_sessions", cfg.MaxSessions,
 	)
 
-	if err := server.Run(); err != nil {
+	return runWith(manager, server)
+}
+
+func runWith(manager lifecycleManager, server runnableServer) error {
+	runErr := server.Run()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return errors.Join(runErr, manager.Close(shutdownCtx))
+}
+
+func main() {
+	if err := run(); err != nil {
 		slog.Error("server error", "error", err)
 		os.Exit(1)
 	}

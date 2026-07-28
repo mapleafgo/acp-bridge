@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"time"
 
 	acp "github.com/coder/acp-go-sdk"
 	"github.com/mapleafgo/acp-bridge/internal/config"
@@ -43,6 +44,8 @@ type Manager struct {
 	sessionIndex map[string]sessionRef
 	reservations int
 	closing      bool
+	closeDone    chan struct{}
+	closeErr     error
 	nextGen      uint64
 }
 
@@ -58,6 +61,7 @@ func NewManager(cfg *config.Config, factory ClientFactory) *Manager {
 		factory:      factory,
 		instances:    make(map[driver.AgentType]*instanceSlot),
 		sessionIndex: make(map[string]sessionRef),
+		closeDone:    make(chan struct{}),
 	}
 }
 
@@ -76,7 +80,9 @@ func (m *Manager) CreateSession(ctx context.Context, agentType driver.AgentType,
 	if err != nil {
 		return session.SessionView{}, err
 	}
-	response, err := inst.client.NewSession(ctx, cwd)
+	operationCtx, cancel := m.operationContext()
+	defer cancel()
+	response, err := inst.client.NewSession(operationCtx, cwd)
 	if err != nil {
 		return session.SessionView{}, fmt.Errorf("create ACP session: %w", err)
 	}
@@ -93,20 +99,39 @@ func (m *Manager) CreateSession(ctx context.Context, agentType driver.AgentType,
 }
 
 func (m *Manager) LoadSession(ctx context.Context, id session.ID, cwd string) (session.SessionView, error) {
-	return m.activateExisting(ctx, id, cwd, func(inst *AgentInstance) error {
-		response, err := inst.client.LoadSession(ctx, id.AgentSessionID, cwd)
-		if err == nil {
-			applyInitialMetadataPlaceholder(response)
-		}
+	operationCtx, cancel := m.operationContext()
+	defer cancel()
+	var response *acp.LoadSessionResponse
+	view, err := m.activateExisting(ctx, id, cwd, func(inst *AgentInstance) error {
+		var err error
+		response, err = inst.client.LoadSession(operationCtx, id.AgentSessionID, cwd)
 		return err
 	})
+	if err == nil {
+		if ref, lookupErr := m.session(view.ID.String()); lookupErr == nil {
+			applyInitialMetadata(ref.session, response.Modes, response.ConfigOptions)
+			view = ref.session.View()
+		}
+	}
+	return view, err
 }
 
 func (m *Manager) ResumeSession(ctx context.Context, id session.ID, cwd string) (session.SessionView, error) {
-	return m.activateExisting(ctx, id, cwd, func(inst *AgentInstance) error {
-		_, err := inst.client.ResumeSession(ctx, id.AgentSessionID, cwd)
+	operationCtx, cancel := m.operationContext()
+	defer cancel()
+	var response *acp.ResumeSessionResponse
+	view, err := m.activateExisting(ctx, id, cwd, func(inst *AgentInstance) error {
+		var err error
+		response, err = inst.client.ResumeSession(operationCtx, id.AgentSessionID, cwd)
 		return err
 	})
+	if err == nil {
+		if ref, lookupErr := m.session(view.ID.String()); lookupErr == nil {
+			applyInitialMetadata(ref.session, response.Modes, response.ConfigOptions)
+			view = ref.session.View()
+		}
+	}
+	return view, err
 }
 
 func (m *Manager) activateExisting(
@@ -157,7 +182,9 @@ func (m *Manager) ForkSession(ctx context.Context, qualifiedID string) (session.
 		}
 	}()
 
-	response, err := ref.instance.client.ForkSession(ctx, ref.session.AgentSessionID(), ref.session.CWD())
+	operationCtx, cancel := m.operationContext()
+	defer cancel()
+	response, err := ref.instance.client.ForkSession(operationCtx, ref.session.AgentSessionID(), ref.session.CWD())
 	if err != nil {
 		return session.SessionView{}, err
 	}
@@ -175,9 +202,10 @@ func (m *Manager) CloseSession(ctx context.Context, qualifiedID string) error {
 	if err != nil {
 		return err
 	}
-	if turn := ref.session.Close(); turn != nil {
-		turn.Cancel()
+	if turn := ref.session.CurrentTurn(); turn != nil && isInterruptible(turn.Snapshot().State) {
+		_, _ = m.interrupt(ref, turn, "session closing")
 	}
+	ref.session.Close()
 	if _, err := ref.instance.client.CloseSession(ctx, ref.session.AgentSessionID()); err != nil {
 		ref.session.ReopenAfterCloseFailure()
 		return err
@@ -196,9 +224,10 @@ func (m *Manager) DeleteSession(ctx context.Context, id session.ID) error {
 		return err
 	}
 	if ref, err := m.session(id.String()); err == nil {
-		if turn := ref.session.Close(); turn != nil {
-			turn.Cancel()
+		if turn := ref.session.CurrentTurn(); turn != nil && isInterruptible(turn.Snapshot().State) {
+			_, _ = m.interrupt(ref, turn, "session deleted")
 		}
+		ref.session.Close()
 		inst.client.ForgetSession(id.AgentSessionID)
 		m.removeSession(id.String(), ref)
 	}
@@ -214,6 +243,7 @@ func (m *Manager) SetMode(ctx context.Context, qualifiedID, mode string) (sessio
 		return session.SessionView{}, err
 	}
 	ref.session.SetCurrentMode(mode)
+	ref.session.Touch()
 	return ref.session.View(), nil
 }
 
@@ -222,7 +252,11 @@ func (m *Manager) SetConfig(ctx context.Context, qualifiedID, configID, value st
 	if err != nil {
 		return err
 	}
-	return ref.instance.client.SetSessionConfigOption(ctx, ref.session.AgentSessionID(), configID, value)
+	if err := ref.instance.client.SetSessionConfigOption(ctx, ref.session.AgentSessionID(), configID, value); err != nil {
+		return err
+	}
+	ref.session.Touch()
+	return nil
 }
 
 func (m *Manager) Session(qualifiedID string) (session.SessionView, error) {
@@ -269,11 +303,37 @@ func (m *Manager) History(ctx context.Context, agentType driver.AgentType) ([]ac
 func (m *Manager) Close(ctx context.Context) error {
 	m.mu.Lock()
 	if m.closing {
+		done := m.closeDone
 		m.mu.Unlock()
-		return nil
+		select {
+		case <-done:
+			m.mu.Lock()
+			err := m.closeErr
+			m.mu.Unlock()
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
 	m.closing = true
-	m.cancel()
+	starting := make([]<-chan struct{}, 0, len(m.instances))
+	for _, slot := range m.instances {
+		if slot.ready != nil {
+			starting = append(starting, slot.ready)
+		}
+	}
+	m.mu.Unlock()
+
+	var closeErrors []error
+	for _, ready := range starting {
+		select {
+		case <-ready:
+		case <-ctx.Done():
+			closeErrors = append(closeErrors, ctx.Err())
+		}
+	}
+
+	m.mu.Lock()
 	instances := make([]*AgentInstance, 0, len(m.instances))
 	for _, slot := range m.instances {
 		if slot.instance != nil {
@@ -287,14 +347,19 @@ func (m *Manager) Close(ctx context.Context) error {
 	m.mu.Unlock()
 
 	for _, ref := range refs {
-		if turn := ref.session.Close(); turn != nil {
-			turn.Cancel()
+		if turn := ref.session.CurrentTurn(); turn != nil && isInterruptible(turn.Snapshot().State) {
+			_, _ = m.interrupt(ref, turn, "bridge shutting down")
 		}
+		ref.session.Close()
+		if _, err := ref.instance.client.CloseSession(ctx, ref.session.AgentSessionID()); err != nil {
+			closeErrors = append(closeErrors, err)
+		}
+		ref.instance.client.ForgetSession(ref.session.AgentSessionID())
 	}
-	var firstErr error
+	m.cancel()
 	for _, inst := range instances {
-		if err := inst.client.Close(ctx); err != nil && firstErr == nil {
-			firstErr = err
+		if err := inst.client.Close(ctx); err != nil {
+			closeErrors = append(closeErrors, err)
 		}
 	}
 
@@ -302,11 +367,14 @@ func (m *Manager) Close(ctx context.Context) error {
 	m.instances = make(map[driver.AgentType]*instanceSlot)
 	m.sessionIndex = make(map[string]sessionRef)
 	m.reservations = 0
+	m.closeErr = errors.Join(closeErrors...)
+	close(m.closeDone)
+	closeErr := m.closeErr
 	m.mu.Unlock()
-	return firstErr
+	return closeErr
 }
 
-const closeSessionTimeout = 3_000_000_000
+const closeSessionTimeout = 3 * time.Second
 
 func (m *Manager) reserveSession() error {
 	m.mu.Lock()
@@ -331,6 +399,9 @@ func (m *Manager) releaseReservation() {
 
 func (m *Manager) registerSession(inst *AgentInstance, sess *session.Session) error {
 	id := sess.ID().String()
+	if _, err := session.ParseID(id); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closing {
@@ -366,7 +437,7 @@ func (m *Manager) getInstance(ctx context.Context, agentType driver.AgentType) (
 			m.mu.Unlock()
 			select {
 			case <-ready:
-				continue
+				return slot.instance, slot.err
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			}
@@ -386,7 +457,13 @@ func (m *Manager) getInstance(ctx context.Context, agentType driver.AgentType) (
 
 		m.mu.Lock()
 		current := m.instances[agentType]
-		if current == slot {
+		rejected := current != slot || m.closing
+		if current == slot && rejected {
+			slot.err = ErrManagerClosing
+			close(slot.ready)
+			slot.ready = nil
+			delete(m.instances, agentType)
+		} else if current == slot {
 			slot.instance = inst
 			slot.err = err
 			close(slot.ready)
@@ -397,6 +474,14 @@ func (m *Manager) getInstance(ctx context.Context, agentType driver.AgentType) (
 		}
 		m.mu.Unlock()
 
+		if rejected {
+			if cl != nil {
+				closeCtx, cancel := context.WithTimeout(context.Background(), closeSessionTimeout)
+				_ = cl.Close(closeCtx)
+				cancel()
+			}
+			return nil, ErrManagerClosing
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -407,6 +492,9 @@ func (m *Manager) getInstance(ctx context.Context, agentType driver.AgentType) (
 
 func (m *Manager) watchInstance(inst *AgentInstance) {
 	<-inst.client.Done()
+	closeCtx, cancel := context.WithTimeout(context.Background(), closeSessionTimeout)
+	_ = inst.client.Close(closeCtx)
+	cancel()
 	m.mu.Lock()
 	slot := m.instances[inst.agentType]
 	if slot == nil || slot.instance != inst || inst.generation != slot.instance.generation {
@@ -455,7 +543,16 @@ func applyInitialMetadata(sess *session.Session, modes *acp.SessionModeState, op
 	if modes != nil {
 		sess.SetCurrentMode(string(modes.CurrentModeId))
 	}
-	_ = options
+	sess.SetConfigOptions(configOptionViews(options))
 }
 
-func applyInitialMetadataPlaceholder(*acp.LoadSessionResponse) {}
+func (m *Manager) operationContext() (context.Context, context.CancelFunc) {
+	if m.config.DefaultTimeout > 0 {
+		return context.WithTimeout(m.ctx, m.config.DefaultTimeout)
+	}
+	return context.WithCancel(m.ctx)
+}
+
+func isInterruptible(state session.TurnState) bool {
+	return state == session.TurnRunning || state == session.TurnPermissionRequired
+}

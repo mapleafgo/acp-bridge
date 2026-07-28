@@ -99,6 +99,8 @@ type Turn struct {
 	permissions []PermissionView
 	snapshot    TurnSnapshot
 	changed     chan struct{}
+	controller  chan struct{}
+	finishOnce  sync.Once
 }
 
 func NewTurn(id string, cancel context.CancelFunc) *Turn {
@@ -106,11 +108,22 @@ func NewTurn(id string, cancel context.CancelFunc) *Turn {
 		cancel = func() {}
 	}
 	return &Turn{
-		id:      id,
-		state:   TurnRunning,
-		cancel:  cancel,
-		changed: make(chan struct{}),
+		id:         id,
+		state:      TurnRunning,
+		cancel:     cancel,
+		changed:    make(chan struct{}),
+		controller: make(chan struct{}),
 	}
+}
+
+func (t *Turn) ControllerDone() <-chan struct{} {
+	return t.controller
+}
+
+func (t *Turn) FinishController() {
+	t.finishOnce.Do(func() {
+		close(t.controller)
+	})
 }
 
 func (t *Turn) ID() string {

@@ -3,10 +3,9 @@ package mcp
 import (
 	"context"
 	"log/slog"
-	"sync"
 
 	"github.com/mapleafgo/acp-bridge/internal/config"
-	"github.com/mapleafgo/acp-bridge/internal/session"
+	"github.com/mapleafgo/acp-bridge/internal/instance"
 	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -14,28 +13,20 @@ import (
 type Server struct {
 	sdkServer *sdk.Server
 	config    *config.Config
-	pool      *session.Pool
-
-	mu            sync.Mutex
-	clients       map[string]acpClient
-	clientFactory clientFactory
-	turns         map[session.SessionID]*promptTurn
+	manager   *instance.Manager
 }
 
 // NewServer creates a new MCP server, registers all tools, and returns it.
-func NewServer(cfg *config.Config, pool *session.Pool) *Server {
+func NewServer(cfg *config.Config, manager *instance.Manager) *Server {
 	srv := &Server{
-		clients:       make(map[string]acpClient),
-		clientFactory: defaultClientFactory(cfg),
-		turns:         make(map[session.SessionID]*promptTurn),
 		sdkServer: sdk.NewServer(&sdk.Implementation{
 			Name:    "acp-bridge",
 			Version: "0.1.0",
 		}, &sdk.ServerOptions{
 			Logger: slog.Default(),
 		}),
-		config: cfg,
-		pool:   pool,
+		config:  cfg,
+		manager: manager,
 	}
 	srv.registerTools()
 	srv.registerSkill()
@@ -71,7 +62,7 @@ func (s *Server) registerTools() {
 
 	sdk.AddTool(s.sdkServer, &sdk.Tool{
 		Name:        "acp_progress",
-		Description: "Check an ACP turn by session_id and turn_id. Returns running, permission_required, completed, or interrupted; terminal snapshots remain queryable until the next turn.",
+		Description: "Check a session's current or most recent turn. turn_id is optional and enables exact-match validation.",
 	}, s.handleAcpProgress)
 
 	sdk.AddTool(s.sdkServer, &sdk.Tool{

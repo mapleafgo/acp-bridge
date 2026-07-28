@@ -89,6 +89,14 @@ func (c *fakeClient) Close(context.Context) error {
 	return nil
 }
 
+type emptyIDClient struct {
+	*fakeClient
+}
+
+func (c *emptyIDClient) NewSession(context.Context, string) (*acp.NewSessionResponse, error) {
+	return &acp.NewSessionResponse{}, nil
+}
+
 type fakeFactory struct {
 	mu      sync.Mutex
 	starts  map[driver.AgentType]int
@@ -142,6 +150,94 @@ func TestConcurrentCreateUsesOneInstance(t *testing.T) {
 	}
 }
 
+func TestConcurrentStartFailureIsSharedByWaiters(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		starts int
+	)
+	factoryStarted := make(chan struct{})
+	releaseFactory := make(chan struct{})
+	var startOnce sync.Once
+	factory := func(context.Context, driver.AgentType) (ACPClient, error) {
+		mu.Lock()
+		starts++
+		mu.Unlock()
+		startOnce.Do(func() { close(factoryStarted) })
+		<-releaseFactory
+		return nil, errors.New("start failed")
+	}
+	manager := NewManager(testConfig(10), factory)
+	t.Cleanup(func() { _ = manager.Close(context.Background()) })
+
+	startCalls := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-startCalls
+			_, _ = manager.CreateSession(context.Background(), driver.AgentTypeCodex, "/tmp")
+		}()
+	}
+	close(startCalls)
+	<-factoryStarted
+	time.Sleep(10 * time.Millisecond)
+	close(releaseFactory)
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if starts != 1 {
+		t.Fatalf("starts=%d, want 1", starts)
+	}
+}
+
+func TestManagerCloseDuringInstanceStartReclaimsClient(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	cl := newFakeClient()
+	factory := func(context.Context, driver.AgentType) (ACPClient, error) {
+		close(started)
+		<-release
+		return cl, nil
+	}
+	manager := NewManager(testConfig(10), factory)
+
+	createDone := make(chan error, 1)
+	go func() {
+		_, err := manager.CreateSession(context.Background(), driver.AgentTypeCodex, "/tmp")
+		createDone <- err
+	}()
+	<-started
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- manager.Close(context.Background())
+	}()
+	for {
+		manager.mu.Lock()
+		closing := manager.closing
+		manager.mu.Unlock()
+		if closing {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(release)
+
+	if err := <-createDone; !errors.Is(err, ErrManagerClosing) {
+		t.Fatalf("create error=%v", err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-cl.Done():
+	default:
+		t.Fatal("client was not closed")
+	}
+}
+
 func TestSessionLimitRejectsWithoutEviction(t *testing.T) {
 	factory := newFakeFactory()
 	manager := NewManager(testConfig(2), factory.New)
@@ -154,6 +250,19 @@ func TestSessionLimitRejectsWithoutEviction(t *testing.T) {
 	}
 	if got := len(manager.Sessions()); got != 2 || first.ID == second.ID {
 		t.Fatalf("existing sessions changed: %#v", manager.Sessions())
+	}
+}
+
+func TestCreateRejectsEmptyAgentSessionID(t *testing.T) {
+	manager := NewManager(testConfig(10), func(context.Context, driver.AgentType) (ACPClient, error) {
+		return &emptyIDClient{fakeClient: newFakeClient()}, nil
+	})
+	t.Cleanup(func() { _ = manager.Close(context.Background()) })
+	if _, err := manager.CreateSession(context.Background(), driver.AgentTypeCodex, "/tmp"); !errors.Is(err, session.ErrInvalidSessionID) {
+		t.Fatalf("expected invalid session ID, got %v", err)
+	}
+	if len(manager.Sessions()) != 0 {
+		t.Fatalf("invalid session was registered: %#v", manager.Sessions())
 	}
 }
 
@@ -231,6 +340,25 @@ func TestProgressWithoutTurnReturnsIdle(t *testing.T) {
 	}
 	if view.Status != StatusIdle || view.Turn.ID != "" {
 		t.Fatalf("unexpected idle progress: %#v", view)
+	}
+}
+
+func TestCancelledChatBeforeTurnRegistrationLeavesSessionIdle(t *testing.T) {
+	factory := newFakeFactory()
+	manager := NewManager(testConfig(10), factory.New)
+	t.Cleanup(func() { _ = manager.Close(context.Background()) })
+	created, err := manager.CreateSession(context.Background(), driver.AgentTypeCodex, "/tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := manager.Chat(ctx, created.ID.String(), "ignored", time.Second); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context cancellation, got %v", err)
+	}
+	progress, err := manager.Progress(created.ID.String(), "")
+	if err != nil || progress.Status != StatusIdle {
+		t.Fatalf("progress=%#v err=%v", progress, err)
 	}
 }
 

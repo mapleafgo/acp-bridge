@@ -8,8 +8,9 @@ acp-bridge 是一个 Go 服务，将 ACP 兼容的 agent（codex-acp、claude-ag
 - `internal/config/` — 从 `ACP_BRIDGE_*` 环境变量读取全部配置项。
 - `internal/client/` — 封装 `acp-go-sdk` 的客户端连接与通知处理。
 - `internal/driver/` — 定义 `AgentDriver` 接口及 codex/claude/gemini 三种实现。
+- `internal/instance/` — 管理每种 agent 的单例进程、永久 Session、Turn controller 与中断。
 - `internal/mcp/` — 基于 SDK 的 MCP 服务器、工具注册与各工具 handler。
-- `internal/session/` — 并发安全的 `SessionPool`，含空闲清理与取消传播。
+- `internal/session/` — 并发安全的 Session/Turn 领域模型与限定 Session ID。
   - `internal/mcp/skill.go` 和 `internal/mcp/skill.md` — skill 与 MCP 工具同源暴露（见下方「Skill 与 MCP 的关系」一节）。
 - 测试与源码同目录放置，文件名为 `*_test.go`。架构细节见 `DESIGN.md`。
 
@@ -69,7 +70,7 @@ acp-bridge 把自己的 skill（面向宿主侧模型的「何时使用 acp_* �
 
 ## 配置
 
-运行时行为全部由 `ACP_BRIDGE_*` 环境变量控制（agent 路径、额外参数、超时、会话 TTL、最大会话数、日志级别与格式）。默认值定义在 `internal/config/config.go`。调试 prompt 与权限交互流程时可设置 `ACP_BRIDGE_LOG_LEVEL=debug`。
+运行时行为全部由 `ACP_BRIDGE_*` 环境变量控制（agent 路径、额外参数、同步等待超时、最大会话数、日志级别与格式）。Session 不按空闲时间自动淘汰；默认全局最多 10 个，`ACP_BRIDGE_MAX_SESSIONS=0` 表示无限制。默认值定义在 `internal/config/config.go`。调试 prompt 与权限交互流程时可设置 `ACP_BRIDGE_LOG_LEVEL=debug`。
 
 ## 提交与 Pull Request 指南
 

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -49,6 +50,9 @@ func (m *Manager) Chat(ctx context.Context, qualifiedID, prompt string, wait tim
 	if err != nil {
 		return ChatView{}, err
 	}
+	if err := ctx.Err(); err != nil {
+		return ChatView{}, err
+	}
 
 	promptCtx, promptCancel := context.WithCancel(ref.instance.ctx)
 	turn := session.NewTurn(fmt.Sprintf("t-%d", nextTurnID.Add(1)), promptCancel)
@@ -61,12 +65,15 @@ func (m *Manager) Chat(ctx context.Context, qualifiedID, prompt string, wait tim
 
 	view := turn.Wait(ctx, wait)
 	if ctx.Err() != nil {
-		return m.interrupt(ref, turn, "handler cancelled"), nil
+		interrupted, _ := m.interrupt(ref, turn, "handler cancelled")
+		return interrupted, nil
 	}
+	view = m.withLiveUpdates(ref, view)
 	return makeChatView(ref.session.View(), view), nil
 }
 
 func (m *Manager) runTurn(ref sessionRef, turn *session.Turn, promptCtx context.Context, prompt string) {
+	defer turn.FinishController()
 	results := make(chan promptResult, 1)
 	permissions := ref.instance.client.PermissionEvents(ref.session.AgentSessionID())
 	go func() {
@@ -84,6 +91,7 @@ func (m *Manager) runTurn(ref sessionRef, turn *session.Turn, promptCtx context.
 			snapshot := session.TurnSnapshot{
 				Updates: ref.instance.client.PopUpdates(ref.session.AgentSessionID()),
 			}
+			applySessionUpdates(ref.session, snapshot.Updates)
 			if result.response != nil {
 				snapshot.StopReason = string(result.response.StopReason)
 			}
@@ -102,6 +110,8 @@ func (m *Manager) runTurn(ref sessionRef, turn *session.Turn, promptCtx context.
 			if turn.RequirePermission(permissionView(permission)) {
 				ref.session.SetTurnState(turn, session.StatePermissionPending)
 			}
+		case <-promptCtx.Done():
+			return
 		case <-ref.instance.ctx.Done():
 			return
 		}
@@ -113,6 +123,7 @@ func (m *Manager) Respond(
 	qualifiedID string,
 	requestID string,
 	outcome string,
+	wait time.Duration,
 ) (ChatView, error) {
 	ref, err := m.session(qualifiedID)
 	if err != nil {
@@ -137,12 +148,17 @@ func (m *Manager) Respond(
 		return ChatView{}, err
 	}
 	ref.session.Touch()
-	updated := turn.Snapshot()
+	updated := turn.Wait(ctx, wait)
+	if ctx.Err() != nil {
+		interrupted, _ := m.interrupt(ref, turn, "handler cancelled")
+		return interrupted, nil
+	}
 	if updated.State == session.TurnPermissionRequired {
 		ref.session.SetTurnState(turn, session.StatePermissionPending)
 	} else {
 		ref.session.SetTurnState(turn, session.StatePrompting)
 	}
+	updated = m.withLiveUpdates(ref, updated)
 	return makeChatView(ref.session.View(), updated), nil
 }
 
@@ -161,10 +177,71 @@ func (m *Manager) Progress(qualifiedID, turnID string) (ChatView, error) {
 	if turnID != "" && view.Turn.ID != turnID {
 		return ChatView{}, session.ErrTurnMismatch
 	}
-	return makeChatView(view, *view.Turn), nil
+	turn := m.withLiveUpdates(ref, *view.Turn)
+	return makeChatView(ref.session.View(), turn), nil
 }
 
-func (m *Manager) Interrupt(ctx context.Context, qualifiedID, turnID string) (ChatView, error) {
+func (m *Manager) withLiveUpdates(ref sessionRef, turn session.TurnView) session.TurnView {
+	if turn.State == session.TurnRunning || turn.State == session.TurnPermissionRequired {
+		turn.Updates = ref.instance.client.PeekUpdates(ref.session.AgentSessionID())
+	}
+	applySessionUpdates(ref.session, turn.Updates)
+	return turn
+}
+
+func applySessionUpdates(sess *session.Session, updates []acp.SessionNotification) {
+	for _, notification := range updates {
+		update := notification.Update
+		if update.SessionInfoUpdate != nil && update.SessionInfoUpdate.Title != nil {
+			sess.SetTitle(*update.SessionInfoUpdate.Title)
+		}
+		if update.CurrentModeUpdate != nil {
+			sess.SetCurrentMode(string(update.CurrentModeUpdate.CurrentModeId))
+		}
+		if update.ConfigOptionUpdate != nil {
+			sess.SetConfigOptions(configOptionViews(update.ConfigOptionUpdate.ConfigOptions))
+		}
+		if update.AvailableCommandsUpdate != nil {
+			commands := make([]session.AvailableCommandInfo, 0, len(update.AvailableCommandsUpdate.AvailableCommands))
+			for _, command := range update.AvailableCommandsUpdate.AvailableCommands {
+				view := session.AvailableCommandInfo{
+					Name:        command.Name,
+					Description: command.Description,
+				}
+				if command.Input != nil && command.Input.Unstructured != nil {
+					view.InputHint = command.Input.Unstructured.Hint
+				}
+				commands = append(commands, view)
+			}
+			sess.SetAvailableCommands(commands)
+		}
+	}
+}
+
+func configOptionViews(options []acp.SessionConfigOption) []session.ConfigOptionInfo {
+	views := make([]session.ConfigOptionInfo, 0, len(options))
+	for _, option := range options {
+		view := session.ConfigOptionInfo{}
+		switch {
+		case option.Select != nil:
+			view.ID = string(option.Select.Id)
+			view.Name = option.Select.Name
+			view.Type = "select"
+			view.Value = string(option.Select.CurrentValue)
+		case option.Boolean != nil:
+			view.ID = string(option.Boolean.Id)
+			view.Name = option.Boolean.Name
+			view.Type = "boolean"
+			view.Value = strconv.FormatBool(option.Boolean.CurrentValue)
+		default:
+			continue
+		}
+		views = append(views, view)
+	}
+	return views
+}
+
+func (m *Manager) Interrupt(_ context.Context, qualifiedID, turnID string) (ChatView, error) {
 	ref, err := m.session(qualifiedID)
 	if err != nil {
 		return ChatView{}, err
@@ -180,18 +257,22 @@ func (m *Manager) Interrupt(ctx context.Context, qualifiedID, turnID string) (Ch
 	if snapshot.State != session.TurnRunning && snapshot.State != session.TurnPermissionRequired {
 		return ChatView{}, ErrTurnNotInterruptible
 	}
-	return m.interrupt(ref, turn, "interrupted by user"), nil
+	view, interrupted := m.interrupt(ref, turn, "interrupted by user")
+	if !interrupted {
+		return ChatView{}, ErrTurnNotInterruptible
+	}
+	return view, nil
 }
 
-func (m *Manager) interrupt(ref sessionRef, turn *session.Turn, reason string) ChatView {
+func (m *Manager) interrupt(ref sessionRef, turn *session.Turn, reason string) (ChatView, bool) {
 	snapshot := session.TurnSnapshot{
-		Updates: ref.instance.client.PeekUpdates(ref.session.AgentSessionID()),
+		Updates: ref.instance.client.PopUpdates(ref.session.AgentSessionID()),
 		Error:   reason,
 	}
+	applySessionUpdates(ref.session, snapshot.Updates)
 	if !turn.Interrupt(snapshot) {
-		return makeChatView(ref.session.View(), turn.Snapshot())
+		return makeChatView(ref.session.View(), turn.Snapshot()), false
 	}
-	ref.session.FinishTurn(turn)
 	turn.Cancel()
 
 	cancelCtx, cancel := context.WithTimeout(ref.instance.ctx, 3*time.Second)
@@ -203,7 +284,16 @@ func (m *Manager) interrupt(ref sessionRef, turn *session.Turn, reason string) C
 			"error", err,
 		)
 	}
-	return makeChatView(ref.session.View(), turn.Snapshot())
+	select {
+	case <-turn.ControllerDone():
+	case <-time.After(3 * time.Second):
+		slog.Warn("等待 Turn controller 退出超时",
+			"session_id", ref.session.ID().String(),
+			"turn_id", turn.ID(),
+		)
+	}
+	ref.session.FinishTurn(turn)
+	return makeChatView(ref.session.View(), turn.Snapshot()), true
 }
 
 func permissionView(event client.PermissionEvent) session.PermissionView {
