@@ -25,7 +25,7 @@
 - 每个 Session 只保留一个当前 Turn；
 - `completed` 和 `interrupted` 快照保留到下一轮 `acp_chat`；
 - `acp_progress` 必须接收 `session_id`，可以额外接收 `turn_id` 做精确校验；
-- Session 尚无 Turn 时，`acp_progress(session_id)` 返回正常状态 `ready`；
+- Session 尚无 Turn 时，`acp_progress(session_id)` 返回统一的 Session 状态 `idle`；
 - `acp_interrupt` 必须接收 `session_id + turn_id`；
 - `acp_respond` 使用 `session_id + request_id + outcome`；
 - `acp_interrupt` 只中断 Turn，不关闭 Session。
@@ -332,10 +332,10 @@ error
 
 `acp_progress` 支持两种查询：
 
-- `acp_progress(session_id)` 查询当前或最近一个 Turn；Session 尚无 Turn 时返回 `ready`；
+- `acp_progress(session_id)` 查询当前或最近一个 Turn；Session 尚无 Turn 时返回 `idle`；
 - `acp_progress(session_id, turn_id)` 在查询状态前额外校验 Turn ID，不匹配时返回 `turn mismatch`。
 
-查询本身不改变 Session 或 Turn 状态，也不删除终态快照。`ready` 不返回 `turn_id`，其他正常状态返回实际 `turn_id`。
+查询本身不改变 Session 或 Turn 状态，也不删除终态快照。`idle` 不返回 `turn_id`，其他正常状态返回实际 `turn_id`。
 
 ### 显式中断
 
@@ -570,7 +570,7 @@ MCP stdio 结束或 Server.Run 返回后：
 1. 每个 Session 同时只允许一个 Turn；
 2. 不同 Session 可以并发 Prompt；
 3. 等待超时返回 running 且不取消 Turn；
-4. `acp_progress(session_id)` 在无 Turn 时返回 ready；
+4. `acp_progress(session_id)` 在无 Turn 时返回 `idle`；
 5. `acp_progress(session_id)` 可查询当前或最近 Turn；
 6. `acp_progress(session_id, turn_id)` 可以精确校验 Turn；
 7. 正确的 `session_id + turn_id` 可以中断；
