@@ -1,0 +1,15 @@
+# 构建产物
+/bin/
+/acp-bridge
+
+# IDE / 编辑器
+.idea/
+.vscode/
+.DS_Store
+
+# 本地 agent / codex 工作目录
+.agents/
+.codex/
+
+# Taskfile 缓存
+.task/

@@ -1,0 +1,60 @@
+version: '3'
+
+vars:
+  BINARY: bin/acp-bridge
+  PACKAGE: ./cmd/acp-bridge
+
+tasks:
+  default:
+    desc: 列出所有可用任务
+    cmds:
+      - task --list
+
+  build:
+    desc: 编译 acp-bridge 二进制到 bin/
+    sources:
+      - ./**/*.go
+      - go.mod
+      - go.sum
+    generates:
+      - "{{.BINARY}}"
+    cmds:
+      - go build -buildvcs=false -o {{.BINARY}} {{.PACKAGE}}
+
+  run:
+    desc: 直接运行（stdio 模式，调试用）
+    cmds:
+      - go run -buildvcs=false {{.PACKAGE}}
+
+  test:
+    desc: 运行全部测试（开启竞态检测）
+    cmds:
+      - go test -buildvcs=false -race ./...
+
+  test:verbose:
+    desc: 运行全部测试，输出详细信息
+    cmds:
+      - go test -buildvcs=false -race -v ./...
+
+  vet:
+    desc: 静态检查
+    cmds:
+      - go vet ./...
+
+  fmt:
+    desc: 格式化全部 Go 源码
+    cmds:
+      - go fmt ./...
+
+  check:
+    desc: 一键检查：fmt + vet + test + build
+    cmds:
+      - task: fmt
+      - task: vet
+      - task: test
+      - task: build
+
+  clean:
+    desc: 清理构建产物
+    cmds:
+      - rm -rf bin/
