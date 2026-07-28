@@ -6,28 +6,28 @@
 
 Hermes 只需持有 `session_id`，即可判断当前对话是否空闲、正在执行、等待权限、已经完成或已经中断；需要防止误查旧 turn 时，仍可额外传入 `turn_id` 做精确校验。
 
-本设计替代 `2026-07-29-hermes-session-turn-contract-design.md` 中“`acp_progress` 必须携带 `turn_id`”的约定；其他会话和 turn 契约保持不变。
+本设计替代 `2026-07-29-hermes-session-turn-contract-design.md` 中“`acp_progress` 必须携带 `turn_id`”的约定。Session ID、Turn 所有权和 Session 生命周期统一遵循 `2026-07-29-agent-instance-lifecycle-design.md`。
 
 ## 查询范围
 
-每个 bridge Session 仍只保留当前或最近一个 turn，不新增 turn 历史。
+每个活跃 Session 仍只保留当前或最近一个 turn，不新增 turn 历史。
 
 - 新一轮 `acp_chat` 开始后，新 turn 替换上一轮；
 - `acp_progress(session_id)` 始终查询当前或最近一个 turn；
-- 关闭 Session 或被 TTL/LRU 清理后，查询返回 `session not found`。
+- 用户关闭 Session、所属 agent 实例退出或 bridge 退出后，查询返回 `session not found`。
 
 ## 输入契约
 
 `acp_progress` 输入：
 
-- `session_id`：必填，bridge Session ID；
+- `session_id`：必填，格式为 `<agent_type>:<agent_session_id>` 的活跃 Session ID；
 - `turn_id`：可选，用于校验查询目标是否为当前或最近一个 turn。
 
 ### 只传 session_id
 
 ```json
 {
-  "session_id": "s-1"
+  "session_id": "codex:session-1"
 }
 ```
 
@@ -41,7 +41,7 @@ Hermes 只需持有 `session_id`，即可判断当前对话是否空闲、正在
 
 ```json
 {
-  "session_id": "s-1",
+  "session_id": "codex:session-1",
   "turn_id": "t-1"
 }
 ```
@@ -73,12 +73,12 @@ Prompt 自身执行失败继续作为 MCP 工具错误返回，不转换为 `idl
 
 ## idle 返回
 
-Session 存在但 `Server.turns` 中没有对应 turn 时：
+Session 存在但 `Session.currentTurn` 为空时：
 
 ```json
 {
   "status": "idle",
-  "session_id": "s-1",
+  "session_id": "codex:session-1",
   "state": "idle"
 }
 ```
@@ -108,13 +108,13 @@ bridge 不生成默认标题。
 Hermes 的默认状态查询只需传入 `session_id`：
 
 ```text
-acp_progress(session_id: "s-1")
+acp_progress(session_id: "codex:session-1")
 ```
 
 当 Hermes 保存了某次 `acp_chat` 返回的 `turn_id`，并希望确认查询目标没有被新一轮替换时，可以使用：
 
 ```text
-acp_progress(session_id: "s-1", turn_id: "t-1")
+acp_progress(session_id: "codex:session-1", turn_id: "t-1")
 ```
 
 查询本身不改变 Session 或 turn 状态，也不删除最终快照。
@@ -124,7 +124,6 @@ acp_progress(session_id: "s-1", turn_id: "t-1")
 - Session 不存在：`session not found`；
 - 显式传入 `turn_id`，但 Session 没有 turn：`turn not found`；
 - 显式传入的 `turn_id` 与当前或最近 turn 不一致：`turn mismatch`；
-- agent client 不可用：`agent client unavailable`；
 - Prompt 执行失败：保留原有工具错误。
 
 上述错误均使用 MCP `IsError: true`。`idle` 是正常状态，使用 `IsError: false`。
@@ -168,5 +167,5 @@ acp_progress(session_id: "s-1", turn_id: "t-1")
 
 - turn 历史保留策略；
 - `acp_interrupt`、`acp_respond` 的参数契约；
-- SessionPool 的 TTL、LRU 和容量策略；
-- ACP 子进程或持久化会话协议。
+- AgentInstanceManager 的实例生命周期和容量策略；
+- ACP 持久化会话协议。

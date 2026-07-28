@@ -38,7 +38,7 @@
 - Client 不再由 MCP Server 按类型单独缓存；
 - TTL 和 LRU 不再构成 Turn 终止或 Session 删除条件。
 
-实现完成后，两份现有 Session/Turn 合同文档和 `DESIGN.md` 必须同步更新，不能并存相互矛盾的 Session ID 或生命周期描述。
+实现完成后，既有 Hermes Session/Turn 合同、`DESIGN.md` 和内嵌 skill 必须同步更新，不能并存相互矛盾的 Session ID 或生命周期描述。
 
 ## 核心术语
 
@@ -48,7 +48,7 @@ bridge 内全部 agent 实例的唯一注册表和生命周期入口。
 
 ### AgentInstance
 
-一种 agent 类型在当前 bridge 进程内的唯一运行实例。它是生命周期聚合根，拥有 ACP Client、AgentProcess、Session 和 Turn。
+一种 agent 类型在当前 bridge 进程内的唯一运行实例。它是生命周期聚合根，直接拥有 ACP Client 和 Session，并通过 Session 拥有 Turn。ACP Client 是 AgentProcess 的唯一 owner。
 
 ### Session
 
@@ -79,7 +79,7 @@ AgentInstanceManager
         AgentInstance
         ├── agentType
         ├── ACP Client
-        ├── AgentProcess
+        │   └── AgentProcess
         ├── sessions[qualifiedSessionID]
         ├── instance state
         └── instance lifecycle context
@@ -128,6 +128,8 @@ MCP Server 不再持有 `clients`、`turns` 或 `SessionPool`，只调用 Manage
 - 按 agent 原始 Session ID 路由权限请求；
 - 关闭时解除全部权限等待。
 
+Client 是 AgentProcess 的唯一 owner。AgentInstance 只持有 Client，并通过 `Client.Done()` 观察 ACP 连接或进程退出。
+
 ### `internal/driver`
 
 Driver 不再只返回三根 pipe，而是返回 AgentProcess。AgentProcess 至少提供：
@@ -136,7 +138,8 @@ Driver 不再只返回三根 pipe，而是返回 AgentProcess。AgentProcess 至
 - `Done()` 退出通知；
 - 幂等 `Close(ctx)`；
 - 优雅退出超时后的强制终止；
-- `Wait` 语义，保证子进程被回收。
+- 单一 Wait goroutine，保证子进程只被等待和回收一次；
+- `Close(ctx)` 等待该 goroutine，不得再次调用底层 `cmd.Wait()`。
 
 ### `internal/mcp`
 
@@ -230,7 +233,7 @@ starting ──成功──▶ running
 
 ### 退出检测
 
-Manager 监听 ACP 连接和 AgentProcess 的退出通知。任一通知都可使 Instance 进入 `dead`，但清理必须幂等。
+Manager 监听 `Client.Done()`。Client 合并 ACP 连接和 AgentProcess 的退出通知；任一底层退出都可使 Instance 进入 `dead`，但通知和清理必须幂等。
 
 退出回调携带具体 Instance 指针或 generation。Manager 只有在实例表中仍是同一对象时才执行删除，防止旧实例的延迟退出事件误删新实例。
 
@@ -285,9 +288,12 @@ Session 不存在 paused 状态。关闭成功的 Session 直接从活跃注册�
 6. 原子注册到 Instance 和全局索引；
 7. 把预留名额转为正式 Session；
 8. 任一步失败都释放预留；
-9. agent 已创建 Session 但本地注册失败时，尽力调用 ACP CloseSession 回滚。
+9. agent 已创建 Session 但本地注册失败时，尽力调用 ACP CloseSession 回滚；
+10. agent 返回已经活跃的原始 Session ID 属于协议违约，为避免误关已有 Session，直接把该 Instance 标记为不可用并走实例退出清理。
 
 这样并发创建不会突破上限，也不会因先调用 agent 再检查上限而产生孤儿 Session。
+
+实例启动与 Session 创建事务使用 Manager/Instance 生命周期派生的 context，不直接绑定 MCP handler context。如果新 Session 已创建并注册、但首个 Turn 尚未建立时 handler 被取消，Session 保持 `idle` 并出现在 `acp_sessions`，不自动关闭。
 
 ### 用户关闭
 
@@ -344,16 +350,17 @@ error
 1. 校验 qualified Session ID；
 2. 校验当前保留的 Turn ID；
 3. 只有 running 或 permission_required Turn 可以中断；
-4. 发送 ACP Cancel；
-5. 取消 Prompt context；
-6. 收集已产生的进度；
-7. 原子写入 `interrupted` 终态快照；
-8. Session 回到 `idle`；
-9. 快照保留到下一轮 `acp_chat`。
+4. 在 `Session → Turn` 锁内复制当前进度，提交唯一的 `interrupted` 终态快照，把 Session 切回 `idle`，并解除对应权限等待；
+5. 释放锁后立即取消本地 Prompt context；
+6. 使用 Instance 生命周期派生的短超时 context 尽力发送 ACP Cancel；
+7. 返回已经提交的 `interrupted` 快照；
+8. 快照保留到下一轮 `acp_chat`。
+
+ACP Cancel 发送失败不能阻止本地中断。bridge 记录 Warn 日志并仍返回 `interrupted`，避免用户已经取消但后台 Turn 因通知失败继续占用本地状态。
 
 ### 等待中的请求被宿主取消
 
-如果 `acp_chat` 仍在同步等待，MCP handler context 被宿主取消，等价于中断当前 Turn。
+如果 `acp_chat` 仍在同步等待，MCP handler context 被宿主取消，等价于中断当前 Turn。已取消的 handler context 只表示触发来源，不能用于发送 ACP Cancel。
 
 handler 已持有准确的 Session 和 Turn，不通过可变的“当前 Turn”重新定位，避免取消事件误伤后续新 Turn。该入口和 `acp_interrupt` 调用同一个内部中断方法。
 
@@ -363,9 +370,9 @@ handler 已持有准确的 Session 和 Turn，不通过可变的“当前 Turn�
 
 Turn 终态只能写入一次：
 
-- 完成先获得终态锁时结果为 `completed` 或 `error`；
-- 中断先获得终态锁时结果为 `interrupted`；
-- 后到事件读取并返回已有终态，不得覆盖；
+- 完成先获得 Turn 锁时写入 `completed` 或 `error`，随后到达的中断返回 `turn is not interruptible`；
+- 中断先获得 Turn 锁时写入 `interrupted`，随后到达的 Prompt 完成事件直接丢弃；
+- 任何后到事件都不得覆盖已有终态；
 - 对已终止 Turn 再次中断返回 `turn is not interruptible`。
 
 ### 生命周期销毁
@@ -376,12 +383,23 @@ Turn 终态只能写入一次：
 
 同一 AgentInstance 可以并发运行不同 Session 的 Turn，因此权限请求不能继续通过一个所有 Turn 竞争消费的全局 channel 传递。
 
-Client handler 必须按 agent 原始 Session ID 路由权限事件。Instance 或 Session 订阅自身的权限 channel，确保：
+Client handler 必须同时按 agent 原始 Session ID 和 request ID 路由权限事件：
+
+```text
+permission key = (agent_session_id, request_id)
+PermissionSignal(agentSessionID, requestID)
+RespondPermission(agentSessionID, requestID, response)
+```
+
+Instance 或 Session 订阅自身的权限 channel，确保：
 
 - Codex Session A 的权限请求只被 Session A 消费；
 - Session B 不会抢走 Session A 的请求；
+- 两个 Session 使用相同 request ID 时不会覆盖；
 - Session 关闭时对应等待者被解除；
 - Instance 关闭时全部等待者被解除。
+
+ACP session-scoped elicitation 携带 `sessionId`，按相同规则路由。建立 Session 前仅携带 `requestId` 的 request-scoped elicitation 不属于任何 Session，当前 MCP 工具合同无法安全响应，必须向 agent 返回明确的 ACP `request-scoped elicitation is not supported` 错误，不得伪造空 Session 或使用全局常量键。
 
 ## 容量策略
 
@@ -435,6 +453,8 @@ acp_sessions()
 
 默认按 `last_used_at` 倒序排列，时间相同时按 qualified `session_id` 升序排列。调用列表本身不更新 `last_used_at`。
 
+`last_used_at` 只在创建 Session、开始或终止 Turn、响应权限、设置 mode/config 时更新。`acp_sessions`、`acp_progress` 和 `acp_session_info` 等只读查询不改变活动时间。
+
 ### 返回
 
 ```json
@@ -469,10 +489,10 @@ acp_sessions()
 |---|---|---|
 | idle | 无、completed、interrupted 或 error | `acp_chat` |
 | prompting | running | `acp_progress` |
-| permission_pending | permission_required | `acp_respond` |
+| permission_pending | permission_required | `acp_progress` |
 | closing | 任意 | `none` |
 
-存在当前保留 Turn 时返回 `turn_id` 和 `turn_status`。这样宿主既可以选择某个 Session 继续下一轮，也可以查询或处理中间状态。
+存在当前保留 Turn 时返回 `turn_id` 和 `turn_status`。`acp_sessions` 不返回完整 permission 和 request ID；宿主先调用 `acp_progress(session_id)` 取得权限详情，再调用 `acp_respond`。这样列表只承担发现和导航职责。
 
 ## Bridge 关闭
 
@@ -507,6 +527,11 @@ MCP stdio 结束或 Server.Run 返回后：
 - 不在 Manager 或 Instance 锁内启动进程；
 - 不在全局锁内执行 ACP 网络或 stdio 请求；
 - 不在全局锁内等待子进程退出；
+- 固定加锁顺序为 `Manager → Instance → Session → Turn`；
+- 持有子对象锁时不得反向调用父对象；
+- 回调 Manager 前必须先释放 Instance、Session 或 Turn 锁；
+- MCP handler 不直接组合可变 Session 和 Client 指针，状态转换通过 Manager 或 Instance 方法完成；
+- ACP 调用返回后必须重新校验 Instance generation 和 Session state；
 - 删除索引和释放容量必须原子；
 - 关闭与崩溃清理必须幂等；
 - 完成、中断、关闭和崩溃并发时只能产生一个最终清理结果；
@@ -529,7 +554,9 @@ MCP stdio 结束或 Server.Run 返回后：
 | Turn 已终止 | `turn is not interruptible` |
 | agent 实例启动失败 | `failed to start <type> agent: ...` |
 
-上述业务错误均通过 MCP `IsError: true` 和具体结构化输出返回。
+上述来自 MCP 工具的业务错误均通过 MCP `IsError: true` 和具体结构化输出返回。
+
+request-scoped elicitation 是 agent 发起的 ACP 请求，不经过 MCP 工具 handler。它直接向 agent 返回 ACP not-supported 错误，不构造 `sdk.CallToolResult`。
 
 ## 测试要求
 
@@ -563,7 +590,8 @@ MCP stdio 结束或 Server.Run 返回后：
 4. 所有活跃 Session 工具按 qualified ID 路由到正确实例；
 5. 历史列表返回 qualified ID；
 6. load、resume、delete 从 qualified ID 推导 agent 类型；
-7. 不再生成或接受 bridge `s-*` ID。
+7. 不再生成或接受 bridge `s-*` ID；
+8. Session 创建完成但首个 Turn 尚未建立时取消 handler，Session 保持 idle 并可从列表找回。
 
 ### Turn 与中断
 
@@ -580,7 +608,10 @@ MCP stdio 结束或 Server.Run 返回后：
 11. 完成与中断竞态只产生一个终态；
 12. interrupted 快照保留到下一轮；
 13. 新一轮替换旧 Turn；
-14. 权限请求按 Session 路由，不发生跨 Session 抢读。
+14. 权限 signal 和 response 都按 Session 与 request ID 路由；
+15. 两个 Session 使用相同 request ID 时不冲突；
+16. session-scoped elicitation 按 Session 路由；
+17. request-scoped elicitation 返回明确的不支持错误。
 
 ### Session 列表
 
