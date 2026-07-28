@@ -2,7 +2,6 @@ package driver
 
 import (
 	"context"
-	"io"
 	"strings"
 )
 
@@ -24,9 +23,9 @@ type CodexDriver struct {
 
 func (d *CodexDriver) Type() AgentType { return AgentTypeCodex }
 
-func (d *CodexDriver) Start(ctx context.Context) (io.ReadCloser, io.WriteCloser, io.ReadCloser, error) {
+func (d *CodexDriver) Start(ctx context.Context) (AgentProcess, error) {
 	exe, initialArgs := splitCommand(d.path)
-	return startPipes(ctx, exe, append(initialArgs, d.args...))
+	return startProcess(ctx, exe, append(initialArgs, d.args...))
 }
 
 func (d *CodexDriver) Capabilities() AgentCapabilities {

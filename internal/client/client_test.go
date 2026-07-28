@@ -34,6 +34,35 @@ type mockWriteCloser struct {
 func (m *mockWriteCloser) Write(p []byte) (int, error) { return m.w.Write(p) }
 func (m *mockWriteCloser) Close() error                { return nil }
 
+type mockProcess struct {
+	stdin     io.WriteCloser
+	stdout    io.ReadCloser
+	stderr    io.ReadCloser
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+func (p *mockProcess) Stdin() io.WriteCloser { return p.stdin }
+func (p *mockProcess) Stdout() io.ReadCloser { return p.stdout }
+func (p *mockProcess) Stderr() io.ReadCloser { return p.stderr }
+func (p *mockProcess) Done() <-chan struct{} { return p.done }
+func (p *mockProcess) Err() error            { return nil }
+func (p *mockProcess) Close(context.Context) error {
+	p.closeOnce.Do(func() {
+		if p.stdin != nil {
+			_ = p.stdin.Close()
+		}
+		if p.stdout != nil {
+			_ = p.stdout.Close()
+		}
+		if p.stderr != nil {
+			_ = p.stderr.Close()
+		}
+		close(p.done)
+	})
+	return nil
+}
+
 // mockDriver implements driver.AgentDriver for testing without a real
 // subprocess.
 type mockDriver struct {
@@ -47,16 +76,25 @@ func (m *mockDriver) Capabilities() driver.AgentCapabilities {
 	return driver.AgentCapabilities{}
 }
 
-func (m *mockDriver) Start(ctx context.Context) (io.ReadCloser, io.WriteCloser, io.ReadCloser, error) {
+func (m *mockDriver) Start(ctx context.Context) (driver.AgentProcess, error) {
 	clientRead, agentWrite := io.Pipe()
 	agentRead, clientWrite := io.Pipe()
 	stderrRead, stderrWrite := io.Pipe()
-
-	if m.agentHandler != nil {
-		go m.agentHandler(m.t, agentRead, agentWrite, stderrWrite)
+	process := &mockProcess{
+		stdin:  clientWrite,
+		stdout: clientRead,
+		stderr: stderrRead,
+		done:   make(chan struct{}),
 	}
 
-	return clientRead, clientWrite, stderrRead, nil
+	if m.agentHandler != nil {
+		go func() {
+			m.agentHandler(m.t, agentRead, agentWrite, stderrWrite)
+			process.closeOnce.Do(func() { close(process.done) })
+		}()
+	}
+
+	return process, nil
 }
 
 // errorDriver always fails to start.
@@ -64,8 +102,8 @@ type errorDriver struct{}
 
 func (errorDriver) Type() driver.AgentType                 { return driver.AgentTypeCodex }
 func (errorDriver) Capabilities() driver.AgentCapabilities { return driver.AgentCapabilities{} }
-func (errorDriver) Start(context.Context) (io.ReadCloser, io.WriteCloser, io.ReadCloser, error) {
-	return nil, nil, nil, errors.New("driver start failed")
+func (errorDriver) Start(context.Context) (driver.AgentProcess, error) {
+	return nil, errors.New("driver start failed")
 }
 
 // ---------------------------------------------------------------------------
@@ -113,7 +151,7 @@ func TestHandlerRequestPermissionNormal(t *testing.T) {
 			},
 		},
 	}
-	if injectErr := h.Respond(requestID, expectedResp); injectErr != nil {
+	if injectErr := h.Respond("sess-1", requestID, expectedResp); injectErr != nil {
 		t.Fatalf("Respond: %v", injectErr)
 	}
 
@@ -123,6 +161,62 @@ func TestHandlerRequestPermissionNormal(t *testing.T) {
 	}
 	if resp.Outcome.Selected == nil || resp.Outcome.Selected.OptionId != "allow" {
 		t.Errorf("expected Selected.OptionId=allow, got %+v", resp.Outcome)
+	}
+}
+
+func TestPermissionRoutingSeparatesSessionsWithSameRequestID(t *testing.T) {
+	h := newHandler()
+	aEvents := h.PermissionEvents("a")
+	bEvents := h.PermissionEvents("b")
+	request := func(sessionID string) {
+		_, _ = h.RequestPermission(context.Background(), acp.RequestPermissionRequest{
+			SessionId: acp.SessionId(sessionID),
+			ToolCall:  acp.ToolCallUpdate{ToolCallId: "same"},
+		})
+	}
+	go request("a")
+	go request("b")
+
+	if event := <-aEvents; event.SessionID != "a" || event.RequestID != "same" {
+		t.Fatalf("unexpected a event: %#v", event)
+	}
+	if event := <-bEvents; event.SessionID != "b" || event.RequestID != "same" {
+		t.Fatalf("unexpected b event: %#v", event)
+	}
+
+	cancelled := acp.RequestPermissionResponse{Outcome: acp.NewRequestPermissionOutcomeCancelled()}
+	if err := h.Respond("a", "same", cancelled); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Respond("b", "same", cancelled); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPermissionQueuePreservesSessionOrder(t *testing.T) {
+	h := newHandler()
+	events := h.PermissionEvents("ordered")
+	for _, requestID := range []string{"one", "two"} {
+		requestID := requestID
+		go func() {
+			_, _ = h.RequestPermission(context.Background(), acp.RequestPermissionRequest{
+				SessionId: "ordered",
+				ToolCall:  acp.ToolCallUpdate{ToolCallId: acp.ToolCallId(requestID)},
+			})
+		}()
+		event := <-events
+		if event.RequestID != requestID {
+			t.Fatalf("event=%q, want %q", event.RequestID, requestID)
+		}
+	}
+	h.ForgetSession("ordered")
+}
+
+func TestHandlerUnstableCreateElicitationIsUnsupported(t *testing.T) {
+	h := newHandler()
+	_, err := h.UnstableCreateElicitation(context.Background(), acp.UnstableCreateElicitationRequest{})
+	if !errors.Is(err, errNotSupported) {
+		t.Fatalf("expected errNotSupported, got %v", err)
 	}
 }
 
@@ -210,7 +304,7 @@ func TestHandlerRequestPermissionCloseUnblocks(t *testing.T) {
 
 func TestHandlerRespondUnknownID(t *testing.T) {
 	h := newHandler()
-	err := h.Respond("nonexistent", acp.RequestPermissionResponse{})
+	err := h.Respond("session", "nonexistent", acp.RequestPermissionResponse{})
 	if err == nil {
 		t.Fatal("expected error for unknown request ID")
 	}
@@ -307,22 +401,22 @@ func TestHandlerUnsupportedMethods(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// PermissionSignal 测试
+// PermissionEvents 测试
 // ---------------------------------------------------------------------------
 
-func TestHandlerPermissionSignal(t *testing.T) {
+func TestHandlerPermissionEvents(t *testing.T) {
 	h := newHandler()
 
-	// PermissionSignal 应该返回同一个 channel
-	ch1 := h.PermissionSignal()
-	ch2 := h.PermissionSignal()
+	ch1 := h.PermissionEvents("session")
+	ch2 := h.PermissionEvents("session")
 	if ch1 != ch2 {
-		t.Error("PermissionSignal should return the same channel on each call")
+		t.Error("PermissionEvents should return the same channel for one session")
 	}
 }
 
-func TestHandlerPermissionSignalReceivesRequest(t *testing.T) {
+func TestHandlerPermissionEventsReceivesRequest(t *testing.T) {
 	h := newHandler()
+	events := h.PermissionEvents("sess-signal")
 
 	req := acp.RequestPermissionRequest{
 		SessionId: "sess-signal",
@@ -340,16 +434,16 @@ func TestHandlerPermissionSignalReceivesRequest(t *testing.T) {
 	}()
 
 	select {
-	case got := <-h.PermissionSignal():
-		if string(got.ToolCall.ToolCallId) != "tc-signal" {
-			t.Fatalf("expected tool_call_id=tc-signal, got %s", got.ToolCall.ToolCallId)
+	case got := <-events:
+		if got.RequestID != "tc-signal" {
+			t.Fatalf("expected request_id=tc-signal, got %s", got.RequestID)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for permission signal")
 	}
 
 	// Cleanup: respond to unblock the goroutine
-	h.Respond("tc-signal", acp.RequestPermissionResponse{
+	h.Respond("sess-signal", "tc-signal", acp.RequestPermissionResponse{
 		Outcome: acp.NewRequestPermissionOutcomeCancelled(),
 	})
 }
@@ -366,116 +460,27 @@ func TestHandlerUnstableCompleteElicitation(t *testing.T) {
 	}
 }
 
-func TestHandlerUnstableCreateElicitationRoutesToPermission(t *testing.T) {
-	h := newHandler()
-
-	// Form-based elicitation
-	params := acp.UnstableCreateElicitationRequest{
-		Form: &acp.UnstableCreateElicitationForm{
-			Message: "Please enter your API key",
-			Mode:    "form",
-		},
-	}
-
-	var (
-		resp acp.UnstableCreateElicitationResponse
-		err  error
-		wg   sync.WaitGroup
-	)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		resp, err = h.UnstableCreateElicitation(context.Background(), params)
-	}()
-
-	// Verify a permission request was broadcast on permissionSignal.
-	select {
-	case got := <-h.PermissionSignal():
-		if got.ToolCall.Title == nil || *got.ToolCall.Title != "Please enter your API key" {
-			t.Fatalf("expected title from elicitation message, got %+v", got.ToolCall.Title)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for elicitation on permission signal")
-	}
-
-	// Inject an "accept" response via the permission channel.
-	h.Respond("elicitation", acp.RequestPermissionResponse{
-		Outcome: acp.NewRequestPermissionOutcomeSelected("accept"),
-	})
-
-	wg.Wait()
-	if err != nil {
-		t.Fatalf("UnstableCreateElicitation error: %v", err)
-	}
-	if resp.Accept == nil {
-		t.Fatal("expected Accept outcome")
-	}
-}
-
-func TestHandlerUnstableCreateElicitationDecline(t *testing.T) {
-	h := newHandler()
-
-	params := acp.UnstableCreateElicitationRequest{
-		Form: &acp.UnstableCreateElicitationForm{
-			Message: "Confirm action",
-			Mode:    "form",
-		},
-	}
-
-	var (
-		resp acp.UnstableCreateElicitationResponse
-		err  error
-		wg   sync.WaitGroup
-	)
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		resp, err = h.UnstableCreateElicitation(context.Background(), params)
-	}()
-
-	// Wait for signal
-	<-h.PermissionSignal()
-
-	// Inject a "reject" response (maps to Decline)
-	h.Respond("elicitation", acp.RequestPermissionResponse{
-		Outcome: acp.NewRequestPermissionOutcomeCancelled(),
-	})
-
-	wg.Wait()
-	if err != nil {
-		t.Fatalf("UnstableCreateElicitation error: %v", err)
-	}
-	if resp.Decline == nil {
-		t.Fatal("expected Decline outcome")
-	}
-}
-
-func TestHandlerUnstableCreateElicitationOnClosedHandler(t *testing.T) {
-	h := newHandler()
-	h.close()
-
-	_, err := h.UnstableCreateElicitation(context.Background(), acp.UnstableCreateElicitationRequest{})
-	if err == nil {
-		t.Fatal("expected error on closed handler")
-	}
-}
-
 // ---------------------------------------------------------------------------
 // Client lifecycle tests
 // ---------------------------------------------------------------------------
 
 func TestCloseIdempotent(t *testing.T) {
 	h := newHandler()
+	process := &mockProcess{
+		stdin:  &mockWriteCloser{w: &strings.Builder{}},
+		stdout: &mockReadCloser{Reader: strings.NewReader("")},
+		done:   make(chan struct{}),
+	}
 	c := &Client{
 		conn:    nil,
 		handler: h,
-		stdin:   &mockWriteCloser{w: &strings.Builder{}},
-		stdout:  &mockReadCloser{Reader: strings.NewReader("")},
+		process: process,
+		done:    process.done,
 	}
-	if err := c.Close(); err != nil {
+	if err := c.Close(context.Background()); err != nil {
 		t.Fatalf("first Close: %v", err)
 	}
-	if err := c.Close(); err != nil {
+	if err := c.Close(context.Background()); err != nil {
 		t.Fatalf("second Close (idempotent): %v", err)
 	}
 }
@@ -484,6 +489,7 @@ func TestCloseUnblocksPermissionRequests(t *testing.T) {
 	h := newHandler()
 	c := &Client{
 		handler: h,
+		done:    make(chan struct{}),
 	}
 
 	req := acp.RequestPermissionRequest{
@@ -503,7 +509,7 @@ func TestCloseUnblocksPermissionRequests(t *testing.T) {
 
 	time.Sleep(10 * time.Millisecond)
 
-	_ = c.Close()
+	_ = c.Close(context.Background())
 	wg.Wait()
 
 	if err == nil {
@@ -634,7 +640,7 @@ func TestEndToEndNewSessionAndPrompt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer cl.Close()
+	defer cl.Close(context.Background())
 
 	sessResp, err := cl.NewSession(ctx, "/tmp")
 	if err != nil {
@@ -665,7 +671,7 @@ func TestEndToEndNewSessionAndPrompt(t *testing.T) {
 // ---------------------------------------------------------------------------
 // #27 E2E 权限交互：真实 ACP 协议 round-trip
 // agent 通过 AgentSideConnection.RequestPermission 发起权限请求，
-// client handler 接收并路由到 PermissionSignal，RespondPermission 解除阻塞。
+// client handler 按 Session 路由到 PermissionEvents，RespondPermission 解除阻塞。
 // ---------------------------------------------------------------------------
 
 // permissionAgent 在 Prompt 期间主动发起 RequestPermission。
@@ -723,12 +729,13 @@ func TestE2EPermissionRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer cl.Close()
+	defer cl.Close(context.Background())
 
 	_, err = cl.NewSession(ctx, "/tmp")
 	if err != nil {
 		t.Fatalf("NewSession: %v", err)
 	}
+	events := cl.PermissionEvents("perm-session")
 
 	// 启动 prompt — 会阻塞在权限请求上
 	promptErr := make(chan error, 1)
@@ -739,19 +746,19 @@ func TestE2EPermissionRoundTrip(t *testing.T) {
 
 	// 等权限请求到达 client handler
 	select {
-	case req := <-cl.PermissionSignal():
-		if string(req.ToolCall.ToolCallId) != "tc-e2e" {
-			t.Fatalf("expected tool_call_id=tc-e2e, got %s", req.ToolCall.ToolCallId)
+	case event := <-events:
+		if event.RequestID != "tc-e2e" {
+			t.Fatalf("expected request_id=tc-e2e, got %s", event.RequestID)
 		}
-		if len(req.Options) != 2 {
-			t.Fatalf("expected 2 options, got %d", len(req.Options))
+		if len(event.Request.Options) != 2 {
+			t.Fatalf("expected 2 options, got %d", len(event.Request.Options))
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timeout waiting for permission request")
 	}
 
 	// 回复权限请求
-	if err := cl.RespondPermission("tc-e2e", acp.RequestPermissionResponse{
+	if err := cl.RespondPermission("perm-session", "tc-e2e", acp.RequestPermissionResponse{
 		Outcome: acp.NewRequestPermissionOutcomeSelected("allow-e2e"),
 	}); err != nil {
 		t.Fatalf("RespondPermission: %v", err)
@@ -794,7 +801,7 @@ func TestE2ERealNpxStartup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer cl.Close()
+	defer cl.Close(context.Background())
 
 	sessResp, err := cl.NewSession(ctx, "/tmp")
 	if err != nil {

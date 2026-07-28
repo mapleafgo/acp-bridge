@@ -1,9 +1,6 @@
 package driver
 
-import (
-	"context"
-	"io"
-)
+import "context"
 
 // OpenCodeDriver manages an opencode-acp subprocess.
 type OpenCodeDriver struct {
@@ -13,9 +10,9 @@ type OpenCodeDriver struct {
 
 func (d *OpenCodeDriver) Type() AgentType { return AgentTypeOpenCode }
 
-func (d *OpenCodeDriver) Start(ctx context.Context) (io.ReadCloser, io.WriteCloser, io.ReadCloser, error) {
+func (d *OpenCodeDriver) Start(ctx context.Context) (AgentProcess, error) {
 	exe, initialArgs := splitCommand(d.path)
-	return startPipes(ctx, exe, append(initialArgs, d.args...))
+	return startProcess(ctx, exe, append(initialArgs, d.args...))
 }
 
 func (d *OpenCodeDriver) Capabilities() AgentCapabilities {

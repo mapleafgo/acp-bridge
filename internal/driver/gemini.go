@@ -1,9 +1,6 @@
 package driver
 
-import (
-	"context"
-	"io"
-)
+import "context"
 
 // GeminiDriver manages a gemini-agent-acp subprocess.
 type GeminiDriver struct {
@@ -13,8 +10,8 @@ type GeminiDriver struct {
 
 func (d *GeminiDriver) Type() AgentType { return AgentTypeGemini }
 
-func (d *GeminiDriver) Start(ctx context.Context) (io.ReadCloser, io.WriteCloser, io.ReadCloser, error) {
-	return startPipes(ctx, d.path, d.args)
+func (d *GeminiDriver) Start(ctx context.Context) (AgentProcess, error) {
+	return startProcess(ctx, d.path, d.args)
 }
 
 func (d *GeminiDriver) Capabilities() AgentCapabilities {

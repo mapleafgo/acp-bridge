@@ -5,7 +5,6 @@ package driver
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 
@@ -38,9 +37,8 @@ type AgentDriver interface {
 	// Type returns which agent this driver handles.
 	Type() AgentType
 
-	// Start launches the agent subprocess and returns pipes for
-	// communicating with it via the ACP JSON-RPC 2.0 protocol over stdio.
-	Start(ctx context.Context) (stdout io.ReadCloser, stdin io.WriteCloser, stderr io.ReadCloser, err error)
+	// Start launches the agent subprocess and returns its complete lifecycle owner.
+	Start(ctx context.Context) (AgentProcess, error)
 
 	// Capabilities reports which ACP protocol extensions this agent supports.
 	Capabilities() AgentCapabilities
@@ -85,31 +83,6 @@ func NewDriver(agentType AgentType, cfg *config.Config) (AgentDriver, error) {
 	default:
 		return nil, fmt.Errorf("unknown agent type: %s", agentType)
 	}
-}
-
-// startPipes launches a subprocess and returns stdout/stdin/stderr pipes.
-// Shared by all three driver implementations.
-func startPipes(ctx context.Context, exe string, args []string) (io.ReadCloser, io.WriteCloser, io.ReadCloser, error) {
-	cmd, err := buildCmd(ctx, exe, args)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	stdin, err := cmd.StdinPipe()
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	if err := cmd.Start(); err != nil {
-		return nil, nil, nil, err
-	}
-	return stdout, stdin, stderr, nil
 }
 
 // buildCmd constructs an exec.Cmd with binary existence checking and

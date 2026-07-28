@@ -1,9 +1,6 @@
 package driver
 
-import (
-	"context"
-	"io"
-)
+import "context"
 
 // ClaudeDriver manages a claude-agent-acp subprocess.
 type ClaudeDriver struct {
@@ -13,8 +10,8 @@ type ClaudeDriver struct {
 
 func (d *ClaudeDriver) Type() AgentType { return AgentTypeClaude }
 
-func (d *ClaudeDriver) Start(ctx context.Context) (io.ReadCloser, io.WriteCloser, io.ReadCloser, error) {
-	return startPipes(ctx, d.path, d.args)
+func (d *ClaudeDriver) Start(ctx context.Context) (AgentProcess, error) {
+	return startProcess(ctx, d.path, d.args)
 }
 
 func (d *ClaudeDriver) Capabilities() AgentCapabilities {

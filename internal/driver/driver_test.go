@@ -250,7 +250,7 @@ func TestStart_BinaryNotFound(t *testing.T) {
 	d := &CodexDriver{
 		path: "/nonexistent/binary-that-does-not-exist-xyz789",
 	}
-	_, _, _, err := d.Start(context.Background())
+	_, err := d.Start(context.Background())
 	if err == nil {
 		t.Fatal("expected error for nonexistent binary")
 	}
@@ -341,7 +341,7 @@ func TestClaudeDriver_StartBinaryNotFound(t *testing.T) {
 	d := &ClaudeDriver{
 		path: "/nonexistent/claude-binary-xyz789",
 	}
-	_, _, _, err := d.Start(context.Background())
+	_, err := d.Start(context.Background())
 	if err == nil {
 		t.Fatal("expected error for nonexistent claude binary")
 	}
@@ -351,7 +351,7 @@ func TestGeminiDriver_StartBinaryNotFound(t *testing.T) {
 	d := &GeminiDriver{
 		path: "/nonexistent/gemini-binary-xyz789",
 	}
-	_, _, _, err := d.Start(context.Background())
+	_, err := d.Start(context.Background())
 	if err == nil {
 		t.Fatal("expected error for nonexistent gemini binary")
 	}

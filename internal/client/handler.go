@@ -28,15 +28,8 @@ var errNotSupported = errors.New("acp client method not supported by acp-bridge"
 type acpClientHandler struct {
 	mu sync.Mutex
 
-	// permissionCh maps permission request IDs to channels that
-	// RequestPermission blocks on. The channel receives exactly one
-	// response (or is closed on Close).
-	permissionCh map[string]chan acp.RequestPermissionResponse
-
-	// permissionSignal broadcasts each incoming permission request to
-	// the goroutine running the prompt turn. The MCP handler selects
-	// on this channel to surface the request to the user.
-	permissionSignal chan acp.RequestPermissionRequest
+	permissionCh     map[permissionKey]chan acp.RequestPermissionResponse
+	permissionEvents map[string]chan PermissionEvent
 
 	// sessionUpdates accumulates SessionNotifications per session ID.
 	// A call to PopUpdates drains the queue for a given session.
@@ -44,7 +37,20 @@ type acpClientHandler struct {
 
 	// closed is set to true when the handler is shut down. Pending
 	// permission channels are closed to unblock waiters.
-	closed bool
+	closed  bool
+	closeCh chan struct{}
+}
+
+type permissionKey struct {
+	sessionID string
+	requestID string
+}
+
+// PermissionEvent 是按 agent Session 路由的权限请求。
+type PermissionEvent struct {
+	SessionID string
+	RequestID string
+	Request   acp.RequestPermissionRequest
 }
 
 // compile-time interface check
@@ -56,9 +62,10 @@ var _ acp.ClientExperimental = (*acpClientHandler)(nil)
 
 func newHandler() *acpClientHandler {
 	return &acpClientHandler{
-		permissionCh:     make(map[string]chan acp.RequestPermissionResponse),
-		permissionSignal: make(chan acp.RequestPermissionRequest, 8),
+		permissionCh:     make(map[permissionKey]chan acp.RequestPermissionResponse),
+		permissionEvents: make(map[string]chan PermissionEvent),
 		sessionUpdates:   make(map[string][]acp.SessionNotification),
+		closeCh:          make(chan struct{}),
 	}
 }
 
@@ -69,23 +76,37 @@ func newHandler() *acpClientHandler {
 // RequestPermission blocks until a response is injected via Respond.
 // The requestID is derived from the tool-call ID (or prompt context).
 func (h *acpClientHandler) RequestPermission(ctx context.Context, params acp.RequestPermissionRequest) (acp.RequestPermissionResponse, error) {
-	id := permissionRequestID(&params)
+	sessionID := string(params.SessionId)
+	requestID := string(params.ToolCall.ToolCallId)
+	if sessionID == "" {
+		return acp.RequestPermissionResponse{}, errors.New("permission request has empty session ID")
+	}
+	if requestID == "" {
+		return acp.RequestPermissionResponse{}, errors.New("permission request has empty tool call ID")
+	}
+	key := permissionKey{sessionID: sessionID, requestID: requestID}
 
 	h.mu.Lock()
 	if h.closed {
 		h.mu.Unlock()
 		return acp.RequestPermissionResponse{}, errors.New("handler closed")
 	}
+	if _, exists := h.permissionCh[key]; exists {
+		h.mu.Unlock()
+		return acp.RequestPermissionResponse{}, fmt.Errorf("duplicate permission request %q for session %q", requestID, sessionID)
+	}
 	ch := make(chan acp.RequestPermissionResponse, 1)
-	h.permissionCh[id] = ch
+	h.permissionCh[key] = ch
+	events := h.permissionEventsLocked(sessionID)
 	h.mu.Unlock()
 
-	// Surface the request to the prompt-turn goroutine. Non-blocking:
-	// if no one is selecting yet the request is still tracked in
-	// permissionCh and can be resolved via Respond.
 	select {
-	case h.permissionSignal <- params:
-	default:
+	case events <- PermissionEvent{SessionID: sessionID, RequestID: requestID, Request: params}:
+	case <-ctx.Done():
+		h.deletePermission(key)
+		return acp.RequestPermissionResponse{}, ctx.Err()
+	case <-h.closeCh:
+		return acp.RequestPermissionResponse{}, errors.New("handler closed")
 	}
 
 	select {
@@ -95,10 +116,10 @@ func (h *acpClientHandler) RequestPermission(ctx context.Context, params acp.Req
 		}
 		return resp, nil
 	case <-ctx.Done():
-		h.mu.Lock()
-		delete(h.permissionCh, id)
-		h.mu.Unlock()
+		h.deletePermission(key)
 		return acp.RequestPermissionResponse{}, ctx.Err()
+	case <-h.closeCh:
+		return acp.RequestPermissionResponse{}, errors.New("handler closed")
 	}
 }
 
@@ -157,15 +178,16 @@ func (h *acpClientHandler) WaitForTerminalExit(_ context.Context, _ acp.WaitForT
 // Respond injects a permission response for the given requestID, unblocking
 // the corresponding RequestPermission call. Returns an error if no pending
 // request with that ID exists.
-func (h *acpClientHandler) Respond(requestID string, resp acp.RequestPermissionResponse) error {
+func (h *acpClientHandler) Respond(sessionID, requestID string, resp acp.RequestPermissionResponse) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	ch, ok := h.permissionCh[requestID]
+	key := permissionKey{sessionID: sessionID, requestID: requestID}
+	ch, ok := h.permissionCh[key]
 	if !ok {
-		return fmt.Errorf("no pending permission request with ID %q", requestID)
+		return fmt.Errorf("no pending permission request with ID %q for session %q", requestID, sessionID)
 	}
-	delete(h.permissionCh, requestID)
+	delete(h.permissionCh, key)
 	ch <- resp
 	return nil
 }
@@ -194,10 +216,38 @@ func (h *acpClientHandler) PeekUpdates(sessionID string) []acp.SessionNotificati
 	return out
 }
 
-// PermissionSignal returns the channel that receives each incoming
-// permission request. Consumers select on it during a prompt turn.
-func (h *acpClientHandler) PermissionSignal() <-chan acp.RequestPermissionRequest {
-	return h.permissionSignal
+func (h *acpClientHandler) PermissionEvents(sessionID string) <-chan PermissionEvent {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.permissionEventsLocked(sessionID)
+}
+
+func (h *acpClientHandler) permissionEventsLocked(sessionID string) chan PermissionEvent {
+	events, ok := h.permissionEvents[sessionID]
+	if !ok {
+		events = make(chan PermissionEvent, 16)
+		h.permissionEvents[sessionID] = events
+	}
+	return events
+}
+
+func (h *acpClientHandler) ForgetSession(sessionID string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for key, ch := range h.permissionCh {
+		if key.sessionID == sessionID {
+			close(ch)
+			delete(h.permissionCh, key)
+		}
+	}
+	delete(h.permissionEvents, sessionID)
+	delete(h.sessionUpdates, sessionID)
+}
+
+func (h *acpClientHandler) deletePermission(key permissionKey) {
+	h.mu.Lock()
+	delete(h.permissionCh, key)
+	h.mu.Unlock()
 }
 
 // close unblocks all pending permission waiters and marks the handler as
@@ -207,6 +257,7 @@ func (h *acpClientHandler) close() {
 	defer h.mu.Unlock()
 
 	h.closed = true
+	close(h.closeCh)
 	for id, ch := range h.permissionCh {
 		close(ch)
 		delete(h.permissionCh, id)
@@ -214,74 +265,12 @@ func (h *acpClientHandler) close() {
 }
 
 // ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
-
-// permissionRequestID constructs a stable key for a permission request.
-func permissionRequestID(req *acp.RequestPermissionRequest) string {
-	// Use the tool-call ID as the canonical key; fall back to session ID
-	// if no tool-call is present.
-	if req.ToolCall.ToolCallId != "" {
-		return string(req.ToolCall.ToolCallId)
-	}
-	return fmt.Sprintf("session:%s", string(req.SessionId))
-}
-
-// ---------------------------------------------------------------------------
 // Elicitation (ClientExperimental)
 // ---------------------------------------------------------------------------
 
-// UnstableCreateElicitation routes an elicitation request through the same
-// permission signal channel. The MCP handler surfaces it as a
-// permission_required result so the user can respond via acp_respond.
-func (h *acpClientHandler) UnstableCreateElicitation(_ context.Context, params acp.UnstableCreateElicitationRequest) (acp.UnstableCreateElicitationResponse, error) {
-	title := "Elicitation"
-	if params.Form != nil {
-		title = params.Form.Message
-	}
-
-	// Build a synthetic permission request and broadcast it.
-	permReq := acp.RequestPermissionRequest{
-		SessionId: "",
-		ToolCall: acp.ToolCallUpdate{
-			ToolCallId: "elicitation",
-			Title:      &title,
-			Kind:       acp.Ptr(acp.ToolKindOther),
-			Status:     acp.Ptr(acp.ToolCallStatusPending),
-		},
-		Options: []acp.PermissionOption{
-			{OptionId: "accept", Name: "Accept", Kind: acp.PermissionOptionKindAllowOnce},
-			{OptionId: "decline", Name: "Decline", Kind: acp.PermissionOptionKindRejectOnce},
-		},
-	}
-
-	select {
-	case h.permissionSignal <- permReq:
-	default:
-	}
-
-	// Block until a response arrives via Respond (same mechanism as permission).
-	id := "elicitation"
-	h.mu.Lock()
-	if h.closed {
-		h.mu.Unlock()
-		return acp.UnstableCreateElicitationResponse{}, errors.New("handler closed")
-	}
-	ch := make(chan acp.RequestPermissionResponse, 1)
-	h.permissionCh[id] = ch
-	h.mu.Unlock()
-
-	resp := <-ch
-
-	// Map the permission outcome back to an elicitation response.
-	if resp.Outcome.Selected != nil {
-		return acp.UnstableCreateElicitationResponse{
-			Accept: &acp.UnstableCreateElicitationAccept{Action: "accept"},
-		}, nil
-	}
-	return acp.UnstableCreateElicitationResponse{
-		Decline: &acp.UnstableCreateElicitationDecline{Action: "decline"},
-	}, nil
+// UnstableCreateElicitation 缺少 Session ID，无法安全路由到具体 Turn。
+func (h *acpClientHandler) UnstableCreateElicitation(context.Context, acp.UnstableCreateElicitationRequest) (acp.UnstableCreateElicitationResponse, error) {
+	return acp.UnstableCreateElicitationResponse{}, errNotSupported
 }
 
 // UnstableCompleteElicitation is a no-op — acp-bridge does not need to

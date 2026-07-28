@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"time"
 
 	acp "github.com/coder/acp-go-sdk"
 	"github.com/mapleafgo/acp-bridge/internal/driver"
@@ -18,7 +19,7 @@ import (
 //
 //	drv := driver.NewDriver(driver.AgentTypeCodex, cfg)
 //	if err != nil { … }
-//	defer cl.Close()
+//	defer cl.Close(context.Background())
 //
 //	initResp, _ := cl.Initialize(ctx, acp.InitializeRequest{ProtocolVersion: 1})
 //	sessResp, _ := cl.NewSession(ctx, "/home/user/project")
@@ -26,8 +27,8 @@ type Client struct {
 	conn    *acp.ClientSideConnection
 	handler *acpClientHandler
 	driver  driver.AgentDriver
-	stdin   io.WriteCloser
-	stdout  io.ReadCloser
+	process driver.AgentProcess
+	done    chan struct{}
 	mu      sync.Mutex
 	closed  bool
 }
@@ -38,20 +39,20 @@ type Client struct {
 // The mcpServer is reserved for future use (registering MCP tool transport
 // with the agent during session setup); pass nil for now.
 func New(ctx context.Context, drv driver.AgentDriver) (*Client, error) {
-	stdout, stdin, stderr, err := drv.Start(ctx)
+	process, err := drv.Start(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("start agent: %w", err)
 	}
 
 	// Drain stderr in the background to avoid blocking the child process.
 	go func() {
-		if stderr != nil {
-			_, _ = io.Copy(io.Discard, stderr)
+		if process.Stderr() != nil {
+			_, _ = io.Copy(io.Discard, process.Stderr())
 		}
 	}()
 
 	handler := newHandler()
-	conn := acp.NewClientSideConnection(handler, stdin, stdout)
+	conn := acp.NewClientSideConnection(handler, process.Stdin(), process.Stdout())
 	if l := slog.Default(); l.Enabled(ctx, slog.LevelDebug) {
 		conn.SetLogger(l)
 	}
@@ -60,8 +61,10 @@ func New(ctx context.Context, drv driver.AgentDriver) (*Client, error) {
 	if _, err := conn.Initialize(ctx, acp.InitializeRequest{
 		ProtocolVersion: acp.ProtocolVersionNumber,
 	}); err != nil {
-		_ = stdout.Close()
-		_ = stdin.Close()
+		handler.close()
+		closeCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = process.Close(closeCtx)
 		return nil, fmt.Errorf("initialize: %w", err)
 	}
 
@@ -69,9 +72,10 @@ func New(ctx context.Context, drv driver.AgentDriver) (*Client, error) {
 		conn:    conn,
 		handler: handler,
 		driver:  drv,
-		stdin:   stdin,
-		stdout:  stdout,
+		process: process,
+		done:    make(chan struct{}),
 	}
+	go c.watchDone()
 	slog.DebugContext(ctx, "acp client initialized", "agent_type", drv.Type())
 	return c, nil
 }
@@ -230,8 +234,8 @@ func (c *Client) DeleteSession(ctx context.Context, sessionID string) (*acp.Unst
 //	        },
 //	    },
 //	})
-func (c *Client) RespondPermission(requestID string, resp acp.RequestPermissionResponse) error {
-	return c.handler.Respond(requestID, resp)
+func (c *Client) RespondPermission(sessionID, requestID string, resp acp.RequestPermissionResponse) error {
+	return c.handler.Respond(sessionID, requestID, resp)
 }
 
 // PopUpdates drains and returns all accumulated SessionNotifications for
@@ -254,10 +258,18 @@ func (c *Client) PeekUpdates(sessionID string) []acp.SessionNotification {
 
 // Close gracefully shuts down the ACP connection and closes the pipes
 // to the agent subprocess. It is safe to call multiple times.
-func (c *Client) Close() error {
+func (c *Client) Close(ctx context.Context) error {
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
+		if c.done != nil {
+			select {
+			case <-c.done:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		}
 		return nil
 	}
 	c.closed = true
@@ -266,27 +278,31 @@ func (c *Client) Close() error {
 	// Signal the handler to stop blocking permission waiters.
 	c.handler.close()
 
-	// Close stdin to signal EOF to the agent (it should exit on its own).
-	// Then close stdout to release the read side.
-	if c.stdin != nil {
-		_ = c.stdin.Close()
-	}
-	if c.stdout != nil {
-		_ = c.stdout.Close()
+	if c.process != nil {
+		return c.process.Close(ctx)
 	}
 	return nil
 }
 
 // Done returns a channel that closes when the agent disconnects.
 func (c *Client) Done() <-chan struct{} {
-	return c.conn.Done()
+	return c.done
 }
 
-// PermissionSignal returns a channel that receives each incoming permission
-// request from the agent. Callers select on this channel during a prompt turn
-// to detect when the agent needs user authorization.
-func (c *Client) PermissionSignal() <-chan acp.RequestPermissionRequest {
-	return c.handler.PermissionSignal()
+func (c *Client) watchDone() {
+	select {
+	case <-c.conn.Done():
+	case <-c.process.Done():
+	}
+	close(c.done)
+}
+
+func (c *Client) PermissionEvents(sessionID string) <-chan PermissionEvent {
+	return c.handler.PermissionEvents(sessionID)
+}
+
+func (c *Client) ForgetSession(sessionID string) {
+	c.handler.ForgetSession(sessionID)
 }
 
 // Driver returns the underlying AgentDriver used to start this client.
