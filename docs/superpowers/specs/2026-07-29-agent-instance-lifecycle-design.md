@@ -18,7 +18,9 @@
 
 ## 与现有合同的关系
 
-本设计保留 `2026-07-29-hermes-session-turn-contract-design.md` 和 `2026-07-29-acp-progress-session-status-design.md` 已经确定的以下合同：
+本设计是 Agent 实例、Session、Turn 和子进程生命周期的主设计。`2026-07-29-hermes-session-turn-contract-design.md` 定义 Hermes 侧调用合同；`2026-07-29-acp-progress-session-status-design.md` 只扩展 `acp_progress` 的功能面，不定义运行时所有权、Session ID 生成方式、容量或淘汰策略。发生交叉时以本设计为准。
+
+本设计保留两份功能合同已经确定的以下行为：
 
 - `title` 只来自 agent 上报的 `SessionInfoUpdate.Title`；
 - `turn_id` 标识当前保留的 Turn；
@@ -39,6 +41,37 @@
 - TTL 和 LRU 不再构成 Turn 终止或 Session 删除条件。
 
 实现完成后，既有 Hermes Session/Turn 合同、`DESIGN.md` 和内嵌 skill 必须同步更新，不能并存相互矛盾的 Session ID 或生命周期描述。
+
+## 当前代码事实基线
+
+本文描述的是重构目标，不是当前实现。方案以本次修订时的源码和以下直接依赖为基线：
+
+- `github.com/coder/acp-go-sdk v0.13.5`；
+- `github.com/modelcontextprotocol/go-sdk v1.7.0`；
+- `github.com/caarlos0/env/v11 v11.4.1`。
+
+当前运行时由三套并列状态组成：
+
+| 当前代码 | 实际职责 | 与目标的差距 |
+|---|---|---|
+| `internal/mcp.Server.clients` | 按 `agent_type` 缓存一个 `acpClient` | 已具备“每类型一个 Client”的雏形，但没有实例状态、退出清理和安全重建 |
+| `internal/mcp.Server.turns` | 按 bridge Session ID 保存 `promptTurn` | Turn 脱离 Session，由 MCP 层独立管理 |
+| `internal/session.Pool` | 保存 Session、维护 LRU、执行 TTL 清理 | 满容量时自动淘汰，和永久保持目标相反 |
+| `internal/client.Client` | 保存 ACP connection、handler 和 stdio pipe | 没有保存 `exec.Cmd`，不能等待、回收或强制终止子进程 |
+| `internal/client.acpClientHandler` | 汇总通知并用全局 channel 传递权限 | 同一 Client 下多个 Session 会竞争同一个权限 channel |
+
+当前关键调用流如下：
+
+1. `cmd/acp-bridge/main.go` 创建 `session.Pool`，再把它传给 `mcp.NewServer`；
+2. `Server.getOrCreateClient` 在 `Server.mu` 内启动并初始化 agent，同时该锁还保护 `turns`；
+3. `client.New` 把首次 MCP handler context 传给 `driver.Start`，而 driver 使用 `exec.CommandContext`；
+4. `acp_chat` 创建 ACP Session 后再生成一个 `s-*` bridge ID，分别保存 `ID` 与 `ACPSessionID`；
+5. Prompt 使用 `context.Background()` 派生的本地 cancel，Turn 存入 `Server.turns`；
+6. `Pool.Get` 对包括查询在内的每次读取都更新 `LastUsed` 和 LRU；
+7. `Pool.Add` 达到上限时直接淘汰最旧 Session，TTL goroutine 也会删除 Session，但两条路径都不会完成 ACP CloseSession、Turn 索引和 Client 生命周期清理；
+8. `main` 在 `Server.Run` 返回错误时直接 `os.Exit(1)`，正常和异常退出路径都没有统一关闭 Pool、Client 和子进程。
+
+现有 `acp_sessions` 已经是不分页的本地活跃 Session 列表，现有 `promptTurn` 也已经保留终态快照。这两部分行为继续保留，但所有权和 ID 改为本设计定义的结构。
 
 ## 核心术语
 
@@ -80,7 +113,7 @@ AgentInstanceManager
         ├── agentType
         ├── ACP Client
         │   └── AgentProcess
-        ├── sessions[qualifiedSessionID]
+        ├── sessions[agentSessionID]
         ├── instance state
         └── instance lifecycle context
                 │
@@ -104,35 +137,44 @@ MCP Server 不再持有 `clients`、`turns` 或 `SessionPool`，只调用 Manage
 
 ### `internal/instance`
 
-新增实例管理包：
+新增实例管理包，接管当前 `mcp.Server.clients`、`mcp.Server.turns` 和 `session.Pool` 的编排职责：
 
 - `manager.go`：实例注册、全局 Session 索引、容量预留和 bridge 关闭；
 - `instance.go`：单个 agent 实例的状态、Client、Session 集合和退出处理；
-- `factory.go`：通过 Driver 和 Client 创建实例，便于测试注入 mock。
+- `factory.go`：承接当前 `mcp.clientFactory` 测试缝，通过 Driver 和 Client 创建实例。
+
+Manager 的全局索引使用 qualified Session ID；Instance 已知自身 `agent_type`，内部 Session map 只使用 agent 原始 Session ID，避免保存两份等价键。
+
+Manager 对 MCP 层暴露具体方法而不是可变对象：创建类操作为 new/load/resume/fork，Turn 操作为 chat/respond/progress/interrupt，生命周期操作为 close/delete，查询与配置操作为 sessions/history/info/set-mode/set-config。所有方法返回值类型的 view 或业务错误，不返回 `*AgentInstance`、`*Session`、`*Turn` 或 `*client.Client`，避免 handler 重新组合当前实现中的跨表状态。
 
 ### `internal/session`
 
-保留为领域对象包，但删除 Pool、LRU、TTL 和后台清理：
+保留为领域对象包，但把当前集中在 `session.go` 的 Pool 与数据对象拆开：
 
 - `id.go`：qualified Session ID 的构造与解析；
-- `session.go`：Session 状态、元数据和并发安全操作；
-- `turn.go`：Turn 状态、取消函数和终态快照。
+- `session.go`：Session 状态、元数据、当前 Turn 和并发安全操作；
+- `turn.go`：从 `internal/mcp.promptTurn` 迁入的 Turn 状态、取消函数和终态快照；
+- `updates.go`：从 `internal/mcp/collector.go` 迁入的 ACP SessionUpdate 聚合。
+
+删除 `Pool`、`container/list`、`WithCleanupInterval`、`cleanupLoop`、`evictIdle` 和 `evictOldestLocked`。MCP 输出类型仍留在 `internal/mcp`；Session/Turn 只返回不依赖 MCP SDK 的只读 view，避免领域对象依赖 `sdk.CallToolResult`。
+
+当前 `Pool.Get` 返回可变 `*Session`，handler 随后在 Pool 锁外读取 `State`、`Title`、`ConfigOpts` 等字段。目标 Session 字段改为私有，只能通过并发安全方法转换为 view。当前 `Session.Cancel` 下沉到 Turn；`StatusPaused` 和持久化的 `StatusClosed` 删除，`closing` 纳入 Session state，列表中的 `status: active` 由“仍在 Manager 索引中”派生。
 
 ### `internal/client`
 
 继续负责 ACP 协议连接，但需要：
 
-- 持有可管理的 AgentProcess；
+- 在现有 `conn`、`handler`、`stdin`、`stdout` 基础上持有可管理的 AgentProcess；
 - 暴露连接或进程退出通知；
 - 支持幂等关闭；
-- 按 agent 原始 Session ID 路由权限请求；
+- 把现有全局 `permissionSignal` 和仅按 request ID 建键的 `permissionCh` 改为按 Session 路由；
 - 关闭时解除全部权限等待。
 
 Client 是 AgentProcess 的唯一 owner。AgentInstance 只持有 Client，并通过 `Client.Done()` 观察 ACP 连接或进程退出。
 
 ### `internal/driver`
 
-Driver 不再只返回三根 pipe，而是返回 AgentProcess。AgentProcess 至少提供：
+当前 `AgentDriver.Start` 返回三根 pipe，`startPipes` 在 `cmd.Start()` 后丢失 `*exec.Cmd`。重构后 `Start` 返回 AgentProcess。AgentProcess 至少提供：
 
 - stdin、stdout、stderr；
 - `Done()` 退出通知；
@@ -143,7 +185,7 @@ Driver 不再只返回三根 pipe，而是返回 AgentProcess。AgentProcess 至
 
 ### `internal/mcp`
 
-保留工具注册、参数类型、结果类型、ACP 通知到结构化结果的转换。所有 Session、Turn 和 Client 查询统一委托给 Manager。
+保留工具注册、参数类型、结果类型和 domain view 到结构化输出的转换。删除 `Server.pool`、`Server.clients`、`Server.turns`、`getOrCreateClient`、`storeTurn`、`peekTurn` 和 `popTurn`；Server 只持有 Manager，所有 Session、Turn 和 Client 操作统一委托给 Manager。
 
 ## Session ID
 
@@ -207,6 +249,19 @@ type Session struct {
 
 已经注册为活跃 Session 的历史 ID 不能重复 load 或 resume。活跃 Session 不能直接 delete，必须先 `acp_close`。
 
+### 从当前工具参数迁移
+
+| 工具 | 当前代码 | 目标 |
+|---|---|---|
+| `acp_chat` 新建 | agent 返回原始 ID，bridge 再生成 `s-*` | 直接注册并返回 qualified agent Session ID |
+| 活跃 Session 工具 | 接收 `s-*`，再查 `ACPSessionID` | 接收 qualified ID，解析后按 Instance 和原始 ID 路由 |
+| `acp_sessions` | 返回字段 `id`，值为 `s-*` | 返回字段 `session_id`，值为 qualified ID |
+| `acp_list_history` | 参数只有未实际使用的 `cwd`，固定查询 Codex，返回原始 ID | 删除无效 `cwd`，增加可选 `agent_type`，默认 Codex，返回 qualified ID |
+| `acp_load_session` | 原始 ID、`agent_type` 和可选 `cwd` 分开传入 | qualified ID 取代前两项，保留可选 `cwd`，注册同一个 qualified ID |
+| `acp_resume_session` | 先查活跃 bridge Session，再为同一 ACP ID 生成新 `s-*` | 接收未活跃的 qualified 历史 ID，恢复后注册原 ID |
+| `acp_delete_session` | 原始 ID 与 `agent_type` 分开传入 | 只传 qualified ID；活跃时拒绝 |
+| `acp_fork_session` | fork 后生成新的 `s-*` | 使用 agent 返回的新原始 ID 构造 qualified ID |
+
 ## AgentInstance 生命周期
 
 状态机：
@@ -231,9 +286,13 @@ starting ──成功──▶ running
 - 启动失败不注册 Instance，等待中的请求收到相同失败结果；
 - Instance 启动成功后，即使没有 Session 也保持运行。
 
+当前 `getOrCreateClient` 已保证一个 `agent_type` 只缓存一个 Client，但它在 `Server.mu` 内执行 `client.New`，并把调用者 context 传给 `exec.CommandContext`。Manager 必须用 `starting` 占位和完成 channel 复用同一次启动结果，在锁外使用 Manager 生命周期 context 创建 Client；不能继续沿用当前函数实现。
+
 ### 退出检测
 
 Manager 监听 `Client.Done()`。Client 合并 ACP 连接和 AgentProcess 的退出通知；任一底层退出都可使 Instance 进入 `dead`，但通知和清理必须幂等。
+
+当前 `Client.Done()` 只返回 `ClientSideConnection.Done()`，当前 `Client.Close()` 也只关闭 pipe。重构后的 `Client.Done()` 必须合并 connection Done 与 AgentProcess Done；`Client.Close(ctx)` 必须关闭 handler、关闭连接和 pipe，并等待 AgentProcess 的唯一 Wait goroutine 完成。
 
 退出回调携带具体 Instance 指针或 generation。Manager 只有在实例表中仍是同一对象时才执行删除，防止旧实例的延迟退出事件误删新实例。
 
@@ -295,6 +354,8 @@ Session 不存在 paused 状态。关闭成功的 Session 直接从活跃注册�
 
 实例启动与 Session 创建事务使用 Manager/Instance 生命周期派生的 context，不直接绑定 MCP handler context。如果新 Session 已创建并注册、但首个 Turn 尚未建立时 handler 被取消，Session 保持 `idle` 并出现在 `acp_sessions`，不自动关闭。
 
+以 Turn 成功注册到 `Session.currentTurn` 为取消语义分界：注册前的 handler 取消不删除已创建 Session；注册后的 handler 取消按下文“等待中的请求被宿主取消”执行中断。
+
 ### 用户关闭
 
 `acp_close`：
@@ -334,6 +395,8 @@ error
 - Session 保持 `prompting`；
 - 后续使用 `acp_progress` 查询。
 
+当前 `runPromptTurn` 已让 Prompt goroutine 脱离 handler 等待超时，但 Prompt 完成、权限事件和状态转换仍由每次进入 `waitForTurn` 或 `acp_progress` 的 MCP handler 竞争处理。目标实现为每个 Turn 启动一个 controller goroutine，它是 Prompt 完成和该 Session 权限事件的唯一消费者，并负责写入 Turn/Session 状态。MCP handler 只等待或读取 Turn 快照，不直接消费 Client channel。
+
 ### 状态查询
 
 `acp_progress` 支持两种查询：
@@ -366,6 +429,8 @@ handler 已持有准确的 Session 和 Turn，不通过可变的“当前 Turn�
 
 如果 `acp_chat` 已经返回 `running`，原请求已结束，后续只能通过 `acp_interrupt(session_id, turn_id)` 中断。
 
+当前 `waitForTurn` 的 `ctx.Done()` 分支会直接 `popTurn`、本地 `cancel()` 并返回 `prompt cancelled`，既没有发送 ACP Cancel，也丢失了可查询快照。该分支必须删除，改为调用 Instance 的统一中断方法。
+
 ### 完成与中断竞态
 
 Turn 终态只能写入一次：
@@ -383,15 +448,19 @@ Turn 终态只能写入一次：
 
 同一 AgentInstance 可以并发运行不同 Session 的 Turn，因此权限请求不能继续通过一个所有 Turn 竞争消费的全局 channel 传递。
 
-Client handler 必须同时按 agent 原始 Session ID 和 request ID 路由权限事件：
+当前 `acpClientHandler.permissionSignal` 是每个 Client 一个共享 channel，`permissionCh` 只按 `ToolCallId` 建键；`waitForTurn` 和 `acp_progress` 都可能从共享 channel 取走其他 Session 的请求。目标实现必须同时按 agent 原始 Session ID 和 request ID 路由权限事件：
 
 ```text
 permission key = (agent_session_id, request_id)
-PermissionSignal(agentSessionID, requestID)
+PermissionEvents(agentSessionID) <-chan PermissionEvent
 RespondPermission(agentSessionID, requestID, response)
 ```
 
-Instance 或 Session 订阅自身的权限 channel，确保：
+`PermissionEvent` 携带 agent Session ID、request ID 和原始 ACP request。request ID 使用 `ToolCall.ToolCallId`；空 ID 视为无效 ACP 请求，不再回退成 `session:<id>`。Client 用复合键 map 保存等待者，并为每个 Session 维护有序事件队列；Turn controller 是该 Session 队列的唯一消费者，事件不得因 channel 暂满而静默丢弃。
+
+同一 Turn 同时出现多个权限请求时按到达顺序逐个暴露：`acp_progress` 返回当前队首请求，`acp_respond` 完成后继续返回下一项；不同 request ID 的等待者不得互相覆盖。
+
+这样确保：
 
 - Codex Session A 的权限请求只被 Session A 消费；
 - Session B 不会抢走 Session A 的请求；
@@ -399,7 +468,9 @@ Instance 或 Session 订阅自身的权限 channel，确保：
 - Session 关闭时对应等待者被解除；
 - Instance 关闭时全部等待者被解除。
 
-ACP session-scoped elicitation 携带 `sessionId`，按相同规则路由。建立 Session 前仅携带 `requestId` 的 request-scoped elicitation 不属于任何 Session，当前 MCP 工具合同无法安全响应，必须向 agent 返回明确的 ACP `request-scoped elicitation is not supported` 错误，不得伪造空 Session 或使用全局常量键。
+当前依赖的 `acp-go-sdk v0.13.5` 中，`UnstableCreateElicitationRequest` 只有 `Form` 和 `Url`，没有 Session ID。现有 handler 把它伪装成空 Session、固定 request ID 为 `"elicitation"` 的权限请求，会在并发时覆盖等待者，也无法由 `acp_progress(session_id)` 稳定找回。
+
+本次重构不设计实例级 elicitation 队列。`UnstableCreateElicitation` 直接返回明确的 ACP not-supported 错误，删除空 Session 和固定 `"elicitation"` 的兼容路径。以后只有 SDK 提供可路由的 Session ID，或另行设计实例级 MCP 交互合同后，才重新开放。
 
 ## 容量策略
 
@@ -420,6 +491,8 @@ ACP_BRIDGE_MAX_SESSIONS=10
 - 不再提供 `ACP_BRIDGE_SESSION_TTL`；
 - 不再运行空闲清理 goroutine；
 - 不再维护 LRU 链表。
+
+当前 `Pool.Add` 在 `len >= MaxSessions` 时调用 `evictOldestLocked` 后继续新增；被淘汰 Session 只执行本地 `Cancel`，不会调用 ACP CloseSession，也不会删除 `Server.turns`。重构时不复用该容量分支：Manager 必须在任何 ACP new/load/resume/fork 之前完成容量预留，满额直接返回错误。
 
 错误结果使用 MCP `IsError: true`，错误文本为：
 
@@ -483,6 +556,8 @@ acp_sessions()
 
 `title` 只使用 agent 上报的非空标题。bridge 不根据 Prompt 生成标题。
 
+当前 `Pool.List` 已一次返回全部元素，但 map 遍历无稳定顺序，且 `Pool.Get` 会让只读查询刷新 `LastUsed`。目标保留无分页行为，改为从 Manager 快照生成结果并稳定排序；列表和其他只读查询不再隐式 Touch。
+
 `next_action`：
 
 | Session 状态 | Turn 状态 | next_action |
@@ -497,6 +572,8 @@ acp_sessions()
 ## Bridge 关闭
 
 bridge 是全部 agent 实例的唯一生命周期 owner。
+
+当前入口没有调用 `Pool.Shutdown`，Server 也没有遍历 `clients` 调用 `Close`；错误路径中的 `os.Exit(1)` 会跳过 defer。下述关闭顺序必须由 `cmd/acp-bridge` 的可返回 `run()` 和 `Manager.Close(ctx)` 统一承载。
 
 MCP stdio 结束或 Server.Run 返回后：
 
@@ -556,7 +633,7 @@ MCP stdio 结束或 Server.Run 返回后：
 
 上述来自 MCP 工具的业务错误均通过 MCP `IsError: true` 和具体结构化输出返回。
 
-request-scoped elicitation 是 agent 发起的 ACP 请求，不经过 MCP 工具 handler。它直接向 agent 返回 ACP not-supported 错误，不构造 `sdk.CallToolResult`。
+`UnstableCreateElicitation` 是 agent 发起的 ACP 请求，不经过 MCP 工具 handler。它直接向 agent 返回 ACP not-supported 错误，不构造 `sdk.CallToolResult`。
 
 ## 测试要求
 
@@ -569,7 +646,9 @@ request-scoped elicitation 是 agent 发起的 ACP 请求，不经过 MCP 工具
 5. 一个实例退出不影响其他类型实例；
 6. agent 退出后的下一次请求创建新实例；
 7. 旧实例延迟退出事件不能删除新实例；
-8. bridge 退出时全部 Client 和子进程被关闭并回收。
+8. bridge 退出时全部 Client 和子进程被关闭并回收；
+9. ACP connection 退出和子进程退出都会触发同一套幂等清理；
+10. AgentProcess 只有一个 Wait goroutine，Close 不会二次调用 `cmd.Wait()`。
 
 ### Session 与容量
 
@@ -610,8 +689,10 @@ request-scoped elicitation 是 agent 发起的 ACP 请求，不经过 MCP 工具
 13. 新一轮替换旧 Turn；
 14. 权限 signal 和 response 都按 Session 与 request ID 路由；
 15. 两个 Session 使用相同 request ID 时不冲突；
-16. session-scoped elicitation 按 Session 路由；
-17. request-scoped elicitation 返回明确的不支持错误。
+16. 权限事件在 MCP handler 没有等待时仍保留，不因 channel 暂满而丢失；
+17. 同一 Session 的多个权限请求按到达顺序逐个响应且不覆盖；
+18. Turn controller 是 Prompt 完成与权限事件的唯一消费者；
+19. `UnstableCreateElicitation` 返回明确的不支持错误，且不创建空 Session 或 `"elicitation"` pending key。
 
 ### Session 列表
 

@@ -6,7 +6,7 @@
 
 Hermes 只需持有 `session_id`，即可判断当前对话是否空闲、正在执行、等待权限、已经完成或已经中断；需要防止误查旧 turn 时，仍可额外传入 `turn_id` 做精确校验。
 
-本设计替代 `2026-07-29-hermes-session-turn-contract-design.md` 中“`acp_progress` 必须携带 `turn_id`”的约定。Session ID、Turn 所有权和 Session 生命周期统一遵循 `2026-07-29-agent-instance-lifecycle-design.md`。
+本设计只扩展 `acp_progress` 的工具功能面：把 `turn_id` 改为可选，并增加无 Turn 时的 `idle` 返回。它不定义 Session ID 生成、运行时所有权、容量或淘汰策略，这些统一以 `2026-07-29-agent-instance-lifecycle-design.md` 为准。实现时应把查询接入该设计的 `Session.currentTurn`，不能为了保留当前 `Server.turns` 而反向约束生命周期架构。
 
 ## 查询范围
 
