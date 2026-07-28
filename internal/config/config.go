@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/caarlos0/env/v11"
@@ -20,12 +21,19 @@ type Config struct {
 
 	// Behaviour
 	DefaultTimeout time.Duration `env:"ACP_BRIDGE_DEFAULT_TIMEOUT" envDefault:"300s"`
-	SessionTTL     time.Duration `env:"ACP_BRIDGE_SESSION_TTL" envDefault:"1800s"`
 	MaxSessions    int           `env:"ACP_BRIDGE_MAX_SESSIONS" envDefault:"10"`
 
 	// Diagnostics
 	LogLevel  string `env:"ACP_BRIDGE_LOG_LEVEL" envDefault:"info"`
 	LogFormat string `env:"ACP_BRIDGE_LOG_FORMAT" envDefault:"text"`
+}
+
+// Validate 检查无法由 env 解码阶段表达的业务约束。
+func (c *Config) Validate() error {
+	if c.MaxSessions < 0 {
+		return fmt.Errorf("ACP_BRIDGE_MAX_SESSIONS must be greater than or equal to 0")
+	}
+	return nil
 }
 
 // Load reads ACP_BRIDGE_* environment variables and returns a Config with defaults.

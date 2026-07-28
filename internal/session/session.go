@@ -124,6 +124,20 @@ func (s *Session) FinishTurn(turn *Turn) bool {
 	return true
 }
 
+func (s *Session) Touch() {
+	s.mu.Lock()
+	s.lastUsed = time.Now()
+	s.mu.Unlock()
+}
+
+func (s *Session) ReopenAfterCloseFailure() {
+	s.mu.Lock()
+	if s.state == StateClosing {
+		s.state = StateIdle
+	}
+	s.mu.Unlock()
+}
+
 func (s *Session) Close() *Turn {
 	s.mu.Lock()
 	defer s.mu.Unlock()

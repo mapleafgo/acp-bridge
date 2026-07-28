@@ -149,9 +149,11 @@ func (c *Client) ListSessions(ctx context.Context) (*acp.ListSessionsResponse, e
 }
 
 // LoadSession loads and replays a persisted session.
-func (c *Client) LoadSession(ctx context.Context, sessionID string) (*acp.LoadSessionResponse, error) {
+func (c *Client) LoadSession(ctx context.Context, sessionID, cwd string) (*acp.LoadSessionResponse, error) {
 	resp, err := c.conn.LoadSession(ctx, acp.LoadSessionRequest{
-		SessionId: acp.SessionId(sessionID),
+		SessionId:  acp.SessionId(sessionID),
+		Cwd:        cwd,
+		McpServers: []acp.McpServer{},
 	})
 	if err != nil {
 		return nil, err
@@ -160,9 +162,11 @@ func (c *Client) LoadSession(ctx context.Context, sessionID string) (*acp.LoadSe
 }
 
 // ResumeSession resumes a previously closed ACP session.
-func (c *Client) ResumeSession(ctx context.Context, sessionID string) (*acp.ResumeSessionResponse, error) {
+func (c *Client) ResumeSession(ctx context.Context, sessionID, cwd string) (*acp.ResumeSessionResponse, error) {
 	resp, err := c.conn.ResumeSession(ctx, acp.ResumeSessionRequest{
-		SessionId: acp.SessionId(sessionID),
+		SessionId:  acp.SessionId(sessionID),
+		Cwd:        cwd,
+		McpServers: []acp.McpServer{},
 	})
 	if err != nil {
 		return nil, err
@@ -197,9 +201,11 @@ func (c *Client) SetSessionConfigOption(ctx context.Context, sessionID, configID
 }
 
 // ForkSession creates a fork (copy) of an existing session.
-func (c *Client) ForkSession(ctx context.Context, sessionID string) (*acp.UnstableForkSessionResponse, error) {
+func (c *Client) ForkSession(ctx context.Context, sessionID, cwd string) (*acp.UnstableForkSessionResponse, error) {
 	resp, err := c.conn.UnstableForkSession(ctx, acp.UnstableForkSessionRequest{
-		SessionId: acp.SessionId(sessionID),
+		SessionId:  acp.SessionId(sessionID),
+		Cwd:        cwd,
+		McpServers: []acp.UnstableMcpServer{},
 	})
 	if err != nil {
 		return nil, err

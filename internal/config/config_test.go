@@ -33,9 +33,6 @@ func TestLoadDefaults(t *testing.T) {
 	if cfg.DefaultTimeout != 300*time.Second {
 		t.Errorf("DefaultTimeout = %v, want %v", cfg.DefaultTimeout, 300*time.Second)
 	}
-	if cfg.SessionTTL != 1800*time.Second {
-		t.Errorf("SessionTTL = %v, want %v", cfg.SessionTTL, 1800*time.Second)
-	}
 	if cfg.MaxSessions != 10 {
 		t.Errorf("MaxSessions = %d, want %d", cfg.MaxSessions, 10)
 	}
@@ -55,7 +52,6 @@ func TestLoadEnvOverrides(t *testing.T) {
 	t.Setenv("ACP_BRIDGE_GEMINI_PATH", "/custom/gemini")
 	t.Setenv("ACP_BRIDGE_OPENCODE_PATH", "/custom/opencode acp")
 	t.Setenv("ACP_BRIDGE_DEFAULT_TIMEOUT", "600s")
-	t.Setenv("ACP_BRIDGE_SESSION_TTL", "30m")
 	t.Setenv("ACP_BRIDGE_MAX_SESSIONS", "42")
 	t.Setenv("ACP_BRIDGE_LOG_LEVEL", "debug")
 	t.Setenv("ACP_BRIDGE_LOG_FORMAT", "json")
@@ -77,9 +73,6 @@ func TestLoadEnvOverrides(t *testing.T) {
 	if cfg.DefaultTimeout != 600*time.Second {
 		t.Errorf("DefaultTimeout = %v, want %v", cfg.DefaultTimeout, 600*time.Second)
 	}
-	if cfg.SessionTTL != 30*time.Minute {
-		t.Errorf("SessionTTL = %v, want %v", cfg.SessionTTL, 30*time.Minute)
-	}
 	if cfg.MaxSessions != 42 {
 		t.Errorf("MaxSessions = %d, want %d", cfg.MaxSessions, 42)
 	}
@@ -88,6 +81,13 @@ func TestLoadEnvOverrides(t *testing.T) {
 	}
 	if cfg.LogFormat != "json" {
 		t.Errorf("LogFormat = %q, want %q", cfg.LogFormat, "json")
+	}
+}
+
+func TestValidateRejectsNegativeMaxSessions(t *testing.T) {
+	cfg := &Config{MaxSessions: -1}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected validation error")
 	}
 }
 

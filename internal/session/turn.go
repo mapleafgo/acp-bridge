@@ -5,6 +5,8 @@ import (
 	"errors"
 	"sync"
 	"time"
+
+	acp "github.com/coder/acp-go-sdk"
 )
 
 // TurnState 表示一次 prompt 的执行状态。
@@ -75,6 +77,7 @@ type TurnSnapshot struct {
 	Plan        []PlanStep
 	FileChanges []FileChange
 	Usage       *Usage
+	Updates     []acp.SessionNotification
 	Error       string
 }
 
@@ -250,6 +253,7 @@ func cloneSnapshot(snapshot TurnSnapshot) TurnSnapshot {
 	}
 	snapshot.Plan = append([]PlanStep(nil), snapshot.Plan...)
 	snapshot.FileChanges = append([]FileChange(nil), snapshot.FileChanges...)
+	snapshot.Updates = append([]acp.SessionNotification(nil), snapshot.Updates...)
 	if snapshot.Usage != nil {
 		usage := *snapshot.Usage
 		snapshot.Usage = &usage
