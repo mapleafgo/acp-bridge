@@ -10,6 +10,7 @@
 # 本地 agent / codex 工作目录
 .agents/
 .codex/
+.worktrees/
 
 # Taskfile 缓存
 .task/
