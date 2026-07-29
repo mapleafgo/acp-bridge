@@ -430,7 +430,7 @@ func TestHandlerPermissionEventsReceivesRequest(t *testing.T) {
 		// arrive immediately.
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		h.RequestPermission(ctx, req)
+		_, _ = h.RequestPermission(ctx, req)
 	}()
 
 	select {
@@ -443,7 +443,7 @@ func TestHandlerPermissionEventsReceivesRequest(t *testing.T) {
 	}
 
 	// Cleanup: respond to unblock the goroutine
-	h.Respond("sess-signal", "tc-signal", acp.RequestPermissionResponse{
+	_ = h.Respond("sess-signal", "tc-signal", acp.RequestPermissionResponse{
 		Outcome: acp.NewRequestPermissionOutcomeCancelled(),
 	})
 }
@@ -534,9 +534,9 @@ func TestNewReturnsErrorOnNonRespondingAgent(t *testing.T) {
 			// Drain stdin so the SDK's blocking write to io.Pipe
 			// completes, but never respond - waitForResponse times
 			// out via context.
-			io.Copy(io.Discard, stdin)
-			stdout.Close()
-			stderr.Close()
+			_, _ = io.Copy(io.Discard, stdin)
+			_ = stdout.Close()
+			_ = stderr.Close()
 		},
 	}
 
@@ -622,9 +622,9 @@ func TestEndToEndNewSessionAndPrompt(t *testing.T) {
 		t: t,
 		agentHandler: func(t *testing.T, stdin io.ReadCloser, stdout io.WriteCloser, stderr io.WriteCloser) {
 			defer func() {
-				stdin.Close()
-				stdout.Close()
-				stderr.Close()
+				_ = stdin.Close()
+				_ = stdout.Close()
+				_ = stderr.Close()
 			}()
 			// peerInput = what the agent writes (stdout)
 			// peerOutput = what the agent reads (stdin)
@@ -640,7 +640,7 @@ func TestEndToEndNewSessionAndPrompt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer cl.Close(context.Background())
+	defer func() { _ = cl.Close(context.Background()) }()
 
 	sessResp, err := cl.NewSession(ctx, "/tmp")
 	if err != nil {
@@ -718,9 +718,9 @@ func TestE2EPermissionRoundTrip(t *testing.T) {
 		t: t,
 		agentHandler: func(_ *testing.T, stdin io.ReadCloser, stdout io.WriteCloser, stderr io.WriteCloser) {
 			defer func() {
-				stdin.Close()
-				stdout.Close()
-				stderr.Close()
+				_ = stdin.Close()
+				_ = stdout.Close()
+				_ = stderr.Close()
 			}()
 			conn := acp.NewAgentSideConnection(agent, stdout, stdin)
 			agent.SetAgentConnection(conn)
@@ -735,7 +735,7 @@ func TestE2EPermissionRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer cl.Close(context.Background())
+	defer func() { _ = cl.Close(context.Background()) }()
 
 	_, err = cl.NewSession(ctx, "/tmp")
 	if err != nil {
@@ -807,7 +807,7 @@ func TestE2ERealNpxStartup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	defer cl.Close(context.Background())
+	defer func() { _ = cl.Close(context.Background()) }()
 
 	sessResp, err := cl.NewSession(ctx, "/tmp")
 	if err != nil {

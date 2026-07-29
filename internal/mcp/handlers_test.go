@@ -20,15 +20,16 @@ import (
 type testACPClient struct {
 	mu sync.Mutex
 
-	next             int
-	firstSessionID   string
-	done             chan struct{}
-	closeOnce        sync.Once
-	loadCalls        []string
-	resumeCalls      []string
-	deleteCalls      []string
-	updates          map[string][]acp.SessionNotification
-	permissionEvents map[string]chan client.PermissionEvent
+	next              int
+	firstSessionID    string
+	done              chan struct{}
+	closeOnce         sync.Once
+	loadCalls         []string
+	resumeCalls       []string
+	deleteCalls       []string
+	closeSessionCalls []string
+	updates           map[string][]acp.SessionNotification
+	permissionEvents  map[string]chan client.PermissionEvent
 }
 
 func newTestACPClient() *testACPClient {
@@ -62,7 +63,10 @@ func (c *testACPClient) Prompt(_ context.Context, sessionID string, _ []acp.Cont
 }
 
 func (c *testACPClient) Cancel(context.Context, string) error { return nil }
-func (c *testACPClient) CloseSession(context.Context, string) (*acp.CloseSessionResponse, error) {
+func (c *testACPClient) CloseSession(_ context.Context, sessionID string) (*acp.CloseSessionResponse, error) {
+	c.mu.Lock()
+	c.closeSessionCalls = append(c.closeSessionCalls, sessionID)
+	c.mu.Unlock()
 	return &acp.CloseSessionResponse{}, nil
 }
 func (c *testACPClient) ListSessions(context.Context) (*acp.ListSessionsResponse, error) {
@@ -125,6 +129,7 @@ func (c *testACPClient) PermissionEvents(sessionID string) <-chan client.Permiss
 }
 func (c *testACPClient) ForgetSession(string)  {}
 func (c *testACPClient) Done() <-chan struct{} { return c.done }
+func (c *testACPClient) Err() error            { return nil }
 func (c *testACPClient) Close(context.Context) error {
 	c.closeOnce.Do(func() { close(c.done) })
 	return nil
@@ -199,6 +204,36 @@ func TestAcpProgressWithWrongTurnIDReturnsMismatch(t *testing.T) {
 	}
 }
 
+func TestAcpInterruptRequiresTurnID(t *testing.T) {
+	server, _, _ := newTestServer(t, 10)
+	result, out, err := server.handleAcpInterrupt(context.Background(), nil, acpTurnArgs{
+		SessionID: "codex:any",
+	})
+	if err != nil || !result.IsError || out.Error != "turn_id is required" {
+		t.Fatalf("result=%#v out=%#v err=%v", result, out, err)
+	}
+}
+
+func TestAcpRespondValidatesRequiredFields(t *testing.T) {
+	server, _, _ := newTestServer(t, 10)
+	tests := []struct {
+		name string
+		args acpRespondArgs
+		want string
+	}{
+		{name: "request ID", args: acpRespondArgs{SessionID: "codex:any", Outcome: "allow"}, want: "request_id is required"},
+		{name: "outcome", args: acpRespondArgs{SessionID: "codex:any", RequestID: "request"}, want: "outcome must be allow or deny"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, out, err := server.handleAcpRespond(context.Background(), nil, tt.args)
+			if err != nil || !result.IsError || out.Error != tt.want {
+				t.Fatalf("result=%#v out=%#v err=%v", result, out, err)
+			}
+		})
+	}
+}
+
 func TestAcpSessionsReturnsAllItems(t *testing.T) {
 	server, manager, _ := newTestServer(t, 0)
 	for range 12 {
@@ -228,7 +263,7 @@ func TestAcpListHistoryDefaultsToCodexAndQualifiesIDs(t *testing.T) {
 	}
 }
 
-func TestAcpLoadAndDeleteDeriveAgentTypeFromQualifiedID(t *testing.T) {
+func TestAcpLoadDerivesAgentTypeFromQualifiedID(t *testing.T) {
 	server, _, factory := newTestServer(t, 10)
 	result, loaded, err := server.handleAcpLoadSession(context.Background(), nil, acpLoadSessionArgs{
 		SessionID: "claude:persisted:one",
@@ -237,16 +272,58 @@ func TestAcpLoadAndDeleteDeriveAgentTypeFromQualifiedID(t *testing.T) {
 	if err != nil || result.IsError || loaded.SessionID != "claude:persisted:one" {
 		t.Fatalf("result=%#v out=%#v err=%v", result, loaded, err)
 	}
-	result, _, err = server.handleAcpDeleteSession(context.Background(), nil, acpDeleteSessionArgs{
+	cl := factory.clients[driver.AgentTypeClaude]
+	if !reflect.DeepEqual(cl.loadCalls, []string{"persisted:one"}) {
+		t.Fatalf("load=%v", cl.loadCalls)
+	}
+}
+
+func TestAcpDeleteDerivesAgentTypeAndRejectsActiveSession(t *testing.T) {
+	server, manager, factory := newTestServer(t, 10)
+	result, _, err := server.handleAcpDeleteSession(context.Background(), nil, acpDeleteSessionArgs{
 		SessionID: "claude:persisted:one",
 	})
 	if err != nil || result.IsError {
 		t.Fatalf("delete result=%#v err=%v", result, err)
 	}
 	cl := factory.clients[driver.AgentTypeClaude]
-	if !reflect.DeepEqual(cl.loadCalls, []string{"persisted:one"}) ||
-		!reflect.DeepEqual(cl.deleteCalls, []string{"persisted:one"}) {
-		t.Fatalf("load=%v delete=%v", cl.loadCalls, cl.deleteCalls)
+	if !reflect.DeepEqual(cl.deleteCalls, []string{"persisted:one"}) {
+		t.Fatalf("delete=%v", cl.deleteCalls)
+	}
+
+	created, createErr := manager.CreateSession(context.Background(), driver.AgentTypeClaude, "/tmp")
+	if createErr != nil {
+		t.Fatal(createErr)
+	}
+	result, out, err := server.handleAcpDeleteSession(context.Background(), nil, acpDeleteSessionArgs{
+		SessionID: created.ID.String(),
+	})
+	if err != nil || !result.IsError || out.Error != instance.ErrSessionActive.Error() {
+		t.Fatalf("active delete result=%#v out=%#v err=%v", result, out, err)
+	}
+}
+
+func TestAcpForkAndCloseSession(t *testing.T) {
+	server, manager, factory := newTestServer(t, 10)
+	created, err := manager.CreateSession(context.Background(), driver.AgentTypeCodex, "/tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, forked, err := server.handleAcpForkSession(context.Background(), nil, acpSessionIDArgs{
+		SessionID: created.ID.String(),
+	})
+	if err != nil || result.IsError || forked.SessionID != "codex:forked" {
+		t.Fatalf("fork result=%#v out=%#v err=%v", result, forked, err)
+	}
+	result, _, err = server.handleAcpClose(context.Background(), nil, acpSessionIDArgs{
+		SessionID: forked.SessionID,
+	})
+	if err != nil || result.IsError {
+		t.Fatalf("close result=%#v err=%v", result, err)
+	}
+	cl := factory.clients[driver.AgentTypeCodex]
+	if !containsString(cl.closeSessionCalls, "forked") {
+		t.Fatalf("close calls=%v", cl.closeSessionCalls)
 	}
 }
 
@@ -264,4 +341,13 @@ func TestMCPArgumentSchemasUseFinalContracts(t *testing.T) {
 	if _, ok := reflect.TypeFor[acpListHistoryArgs]().FieldByName("CWD"); ok {
 		t.Fatal("acp_list_history must not expose cwd")
 	}
+}
+
+func containsString(values []string, target string) bool {
+	for _, value := range values {
+		if value == target {
+			return true
+		}
+	}
+	return false
 }

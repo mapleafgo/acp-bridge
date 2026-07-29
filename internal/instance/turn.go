@@ -15,17 +15,25 @@ import (
 	"github.com/mapleafgo/acp-bridge/internal/session"
 )
 
+// Status 是 MCP 返回的稳定 Turn 状态，不直接暴露内部 Session 状态机。
 type Status string
 
 const (
-	StatusIdle               Status = "idle"
-	StatusRunning            Status = "running"
+	// StatusIdle 表示 Session 没有正在执行的 Turn。
+	StatusIdle Status = "idle"
+	// StatusRunning 表示 Turn 正在执行。
+	StatusRunning Status = "running"
+	// StatusPermissionRequired 表示 Turn 正在等待权限决定。
 	StatusPermissionRequired Status = "permission_required"
-	StatusCompleted          Status = "completed"
-	StatusInterrupted        Status = "interrupted"
-	StatusError              Status = "error"
+	// StatusCompleted 表示最近 Turn 已正常结束。
+	StatusCompleted Status = "completed"
+	// StatusInterrupted 表示最近 Turn 已被中断。
+	StatusInterrupted Status = "interrupted"
+	// StatusError 表示最近 Turn 以错误结束。
+	StatusError Status = "error"
 )
 
+// ErrTurnNotInterruptible 表示 Turn 已终态或不再接受中断。
 var ErrTurnNotInterruptible = errors.New("turn is not interruptible")
 
 // ChatView 是 MCP 层可直接映射的 Session/Turn 值快照。
@@ -45,6 +53,8 @@ type promptResult struct {
 
 var nextTurnID atomic.Uint64
 
+// Chat 在活跃 Session 上启动一个新 Turn。同步等待超时只返回 running；
+// handler context 取消会提交 interrupted 快照，但不会关闭 Session。
 func (m *Manager) Chat(ctx context.Context, qualifiedID, prompt string, wait time.Duration) (ChatView, error) {
 	ref, err := m.session(qualifiedID)
 	if err != nil {
@@ -65,7 +75,7 @@ func (m *Manager) Chat(ctx context.Context, qualifiedID, prompt string, wait tim
 
 	view := turn.Wait(ctx, wait)
 	if ctx.Err() != nil {
-		interrupted, _ := m.interrupt(ref, turn, "handler cancelled")
+		interrupted, _ := m.interrupt(context.WithoutCancel(ctx), ref, turn, "handler cancelled")
 		return interrupted, nil
 	}
 	view = m.withLiveUpdates(ref, view)
@@ -73,7 +83,9 @@ func (m *Manager) Chat(ctx context.Context, qualifiedID, prompt string, wait tim
 }
 
 func (m *Manager) runTurn(ref sessionRef, turn *session.Turn, promptCtx context.Context, prompt string) {
+	startedAt := time.Now()
 	defer turn.FinishController()
+	defer ref.session.FinishTurn(turn)
 	results := make(chan promptResult, 1)
 	permissions := ref.instance.client.PermissionEvents(ref.session.AgentSessionID())
 	go func() {
@@ -103,7 +115,7 @@ func (m *Manager) runTurn(ref sessionRef, turn *session.Turn, promptCtx context.
 				committed = turn.Complete(snapshot)
 			}
 			if committed {
-				ref.session.FinishTurn(turn)
+				logTurnFinished(promptCtx, ref, turn, result.err, time.Since(startedAt))
 			}
 			return
 		case permission := <-permissions:
@@ -118,6 +130,8 @@ func (m *Manager) runTurn(ref sessionRef, turn *session.Turn, promptCtx context.
 	}
 }
 
+// Respond 提交当前权限请求的决定，并等待 Turn 下一次状态变化。
+// requestID 已失效或不属于当前 Turn 时不会向 agent 发送响应。
 func (m *Manager) Respond(
 	ctx context.Context,
 	qualifiedID string,
@@ -150,7 +164,7 @@ func (m *Manager) Respond(
 	ref.session.Touch()
 	updated := turn.Wait(ctx, wait)
 	if ctx.Err() != nil {
-		interrupted, _ := m.interrupt(ref, turn, "handler cancelled")
+		interrupted, _ := m.interrupt(context.WithoutCancel(ctx), ref, turn, "handler cancelled")
 		return interrupted, nil
 	}
 	if updated.State == session.TurnPermissionRequired {
@@ -162,6 +176,7 @@ func (m *Manager) Respond(
 	return makeChatView(ref.session.View(), updated), nil
 }
 
+// Progress 返回 Session 当前或最近 Turn 的稳定快照；turnID 非空时执行精确匹配。
 func (m *Manager) Progress(qualifiedID, turnID string) (ChatView, error) {
 	ref, err := m.session(qualifiedID)
 	if err != nil {
@@ -241,7 +256,9 @@ func configOptionViews(options []acp.SessionConfigOption) []session.ConfigOption
 	return views
 }
 
-func (m *Manager) Interrupt(_ context.Context, qualifiedID, turnID string) (ChatView, error) {
+// Interrupt 中断与 qualifiedID、turnID 同时匹配的运行中 Turn。
+// 本地 interrupted 终态一旦提交便不会因 ACP Cancel 失败而回滚。
+func (m *Manager) Interrupt(ctx context.Context, qualifiedID, turnID string) (ChatView, error) {
 	ref, err := m.session(qualifiedID)
 	if err != nil {
 		return ChatView{}, err
@@ -257,14 +274,20 @@ func (m *Manager) Interrupt(_ context.Context, qualifiedID, turnID string) (Chat
 	if snapshot.State != session.TurnRunning && snapshot.State != session.TurnPermissionRequired {
 		return ChatView{}, ErrTurnNotInterruptible
 	}
-	view, interrupted := m.interrupt(ref, turn, "interrupted by user")
+	view, interrupted := m.interrupt(ctx, ref, turn, "interrupted by user")
 	if !interrupted {
 		return ChatView{}, ErrTurnNotInterruptible
 	}
 	return view, nil
 }
 
-func (m *Manager) interrupt(ref sessionRef, turn *session.Turn, reason string) (ChatView, bool) {
+func (m *Manager) interrupt(
+	budget context.Context,
+	ref sessionRef,
+	turn *session.Turn,
+	reason string,
+) (ChatView, bool) {
+	startedAt := time.Now()
 	snapshot := session.TurnSnapshot{
 		Updates: ref.instance.client.PopUpdates(ref.session.AgentSessionID()),
 		Error:   reason,
@@ -275,25 +298,73 @@ func (m *Manager) interrupt(ref sessionRef, turn *session.Turn, reason string) (
 	}
 	turn.Cancel()
 
-	cancelCtx, cancel := context.WithTimeout(ref.instance.ctx, 3*time.Second)
+	cancelCtx, cancel := interruptContext(ref.instance.ctx, budget)
 	defer cancel()
 	if err := ref.instance.client.Cancel(cancelCtx, ref.session.AgentSessionID()); err != nil {
 		slog.WarnContext(context.Background(), "ACP cancel 失败，本地 Turn 已中断",
+			"agent_type", ref.instance.agentType,
 			"session_id", ref.session.ID().String(),
 			"turn_id", turn.ID(),
+			"reason", reason,
+			"elapsed", time.Since(startedAt),
 			"error", err,
 		)
 	}
 	select {
 	case <-turn.ControllerDone():
-	case <-time.After(3 * time.Second):
-		slog.Warn("等待 Turn controller 退出超时",
-			"session_id", ref.session.ID().String(),
-			"turn_id", turn.ID(),
-		)
+	case <-cancelCtx.Done():
+		if errors.Is(cancelCtx.Err(), context.DeadlineExceeded) {
+			slog.Warn("等待 Turn controller 退出超时",
+				"agent_type", ref.instance.agentType,
+				"session_id", ref.session.ID().String(),
+				"turn_id", turn.ID(),
+				"reason", reason,
+				"elapsed", time.Since(startedAt),
+			)
+		}
 	}
-	ref.session.FinishTurn(turn)
+	slog.Info("ACP Turn 已中断",
+		"agent_type", ref.instance.agentType,
+		"session_id", ref.session.ID().String(),
+		"turn_id", turn.ID(),
+		"reason", reason,
+		"elapsed", time.Since(startedAt),
+	)
 	return makeChatView(ref.session.View(), turn.Snapshot()), true
+}
+
+func logTurnFinished(ctx context.Context, ref sessionRef, turn *session.Turn, err error, elapsed time.Duration) {
+	attributes := []any{
+		"agent_type", ref.instance.agentType,
+		"session_id", ref.session.ID().String(),
+		"turn_id", turn.ID(),
+		"turn_status", turn.Snapshot().State,
+		"elapsed", elapsed,
+	}
+	if err != nil {
+		attributes = append(attributes, "error", err)
+		slog.WarnContext(ctx, "ACP Turn 执行失败", attributes...)
+		return
+	}
+	slog.InfoContext(ctx, "ACP Turn 已结束", attributes...)
+}
+
+const interruptTimeout = 3 * time.Second
+
+func interruptContext(instanceCtx, budget context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(instanceCtx, interruptTimeout)
+	if budget == nil {
+		return ctx, cancel
+	}
+	if budget.Err() != nil {
+		cancel()
+		return ctx, cancel
+	}
+	stop := context.AfterFunc(budget, cancel)
+	return ctx, func() {
+		stop()
+		cancel()
+	}
 }
 
 func permissionView(event client.PermissionEvent) session.PermissionView {

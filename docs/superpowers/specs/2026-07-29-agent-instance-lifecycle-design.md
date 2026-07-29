@@ -352,6 +352,11 @@ Session 不存在 paused 状态。关闭成功的 Session 直接从活跃注册�
 
 这样并发创建不会突破上限，也不会因先调用 agent 再检查上限而产生孤儿 Session。
 
+同一个 qualified Session ID 的 load、resume、delete、fork、close、set-mode 和
+set-config 必须经过 Manager 的按 ID 操作门闩。同一时刻仅一个操作可以调用 ACP；
+后续操作等待前一个 owner 完成，并可被调用方 context 或 Manager 关闭取消。门闩
+只保护状态转换边界，等待和 ACP 调用都发生在 Manager 锁外。
+
 实例启动与 Session 创建事务使用 Manager/Instance 生命周期派生的 context，不直接绑定 MCP handler context。如果新 Session 已创建并注册、但首个 Turn 尚未建立时 handler 被取消，Session 保持 `idle` 并出现在 `acp_sessions`，不自动关闭。
 
 以 Turn 成功注册到 `Session.currentTurn` 为取消语义分界：注册前的 handler 取消不删除已创建 Session；注册后的 handler 取消按下文“等待中的请求被宿主取消”执行中断。
@@ -395,7 +400,7 @@ error
 - Session 保持 `prompting`；
 - 后续使用 `acp_progress` 查询。
 
-当前 `runPromptTurn` 已让 Prompt goroutine 脱离 handler 等待超时，但 Prompt 完成、权限事件和状态转换仍由每次进入 `waitForTurn` 或 `acp_progress` 的 MCP handler 竞争处理。目标实现为每个 Turn 启动一个 controller goroutine，它是 Prompt 完成和该 Session 权限事件的唯一消费者，并负责写入 Turn/Session 状态。MCP handler 只等待或读取 Turn 快照，不直接消费 Client channel。
+当前 `runPromptTurn` 已让 Prompt goroutine 脱离 handler 等待超时，但 Prompt 完成、权限事件和状态转换仍由每次进入 `waitForTurn` 或 `acp_progress` 的 MCP handler 竞争处理。目标实现为每个 Turn 启动一个 controller goroutine，它是 Prompt 完成和该 Session 权限事件的唯一消费者，并负责写入 Turn/Session 状态。MCP handler 只等待或读取 Turn 快照，不直接消费 Client channel。只有 controller 退出清理可以把 Session 从 prompting/permission_pending 恢复为 idle；interrupt 负责提交唯一终态和发送 ACP Cancel，但不得在 controller 退出前提前释放 Session。
 
 ### 状态查询
 
@@ -609,6 +614,9 @@ MCP stdio 结束或 Server.Run 返回后：
 - 回调 Manager 前必须先释放 Instance、Session 或 Turn 锁；
 - MCP handler 不直接组合可变 Session 和 Client 指针，状态转换通过 Manager 或 Instance 方法完成；
 - ACP 调用返回后必须重新校验 Instance generation 和 Session state；
+  对已成功产生远端副作用、且无需再提交本地状态的操作（delete、history），
+  校验失败只记日志，仍按成功返回，避免把已完成的删除/查询报告成失败；
+  load/resume 在注册失败时必须补偿关闭远端 Session；
 - 删除索引和释放容量必须原子；
 - 关闭与崩溃清理必须幂等；
 - 完成、中断、关闭和崩溃并发时只能产生一个最终清理结果；
@@ -625,6 +633,7 @@ MCP stdio 结束或 Server.Run 返回后：
 | 达到容量上限 | `session limit reached: active=N limit=N` |
 | load 或 resume 已活跃 Session | `session already active` |
 | delete 活跃 Session | `session is active; close it before deleting` |
+| ACP 调用期间实例退出或被替换 | `agent instance changed during operation` |
 | `acp_interrupt` 缺少 turn_id | `turn_id is required` |
 | Turn 不存在 | `turn not found` |
 | Turn ID 不匹配 | `turn mismatch` |

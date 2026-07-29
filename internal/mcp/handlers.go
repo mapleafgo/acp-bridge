@@ -40,6 +40,14 @@ func defaultAgentType(raw string) (driver.AgentType, error) {
 	}
 }
 
+func validateSessionID(raw string) error {
+	if raw == "" {
+		return fmt.Errorf("session_id is required")
+	}
+	_, err := session.ParseID(raw)
+	return err
+}
+
 func (s *Server) handleAcpChat(
 	ctx context.Context,
 	_ *sdk.CallToolRequest,
@@ -69,6 +77,8 @@ func (s *Server) handleAcpChat(
 		if err := ctx.Err(); err != nil {
 			return chatErr(err.Error())
 		}
+	} else if err := validateSessionID(sessionID); err != nil {
+		return chatErr(err.Error())
 	}
 
 	view, err := s.manager.Chat(ctx, sessionID, args.Prompt, s.config.DefaultTimeout)
@@ -85,6 +95,15 @@ func (s *Server) handleAcpRespond(
 	_ *sdk.CallToolRequest,
 	args acpRespondArgs,
 ) (*sdk.CallToolResult, chatResultJSON, error) {
+	if err := validateSessionID(args.SessionID); err != nil {
+		return chatErr(err.Error())
+	}
+	if args.RequestID == "" {
+		return chatErr("request_id is required")
+	}
+	if args.Outcome != "allow" && args.Outcome != "deny" {
+		return chatErr("outcome must be allow or deny")
+	}
 	view, err := s.manager.Respond(ctx, args.SessionID, args.RequestID, args.Outcome, s.config.DefaultTimeout)
 	if err != nil {
 		return chatErr(err.Error())
@@ -98,6 +117,12 @@ func (s *Server) handleAcpInterrupt(
 	_ *sdk.CallToolRequest,
 	args acpTurnArgs,
 ) (*sdk.CallToolResult, chatResultJSON, error) {
+	if err := validateSessionID(args.SessionID); err != nil {
+		return chatErr(err.Error())
+	}
+	if args.TurnID == "" {
+		return chatErr("turn_id is required")
+	}
 	view, err := s.manager.Interrupt(ctx, args.SessionID, args.TurnID)
 	if err != nil {
 		return chatErr(err.Error())
@@ -110,6 +135,9 @@ func (s *Server) handleAcpProgress(
 	_ *sdk.CallToolRequest,
 	args acpProgressArgs,
 ) (*sdk.CallToolResult, chatResultJSON, error) {
+	if err := validateSessionID(args.SessionID); err != nil {
+		return chatErr(err.Error())
+	}
 	view, err := s.manager.Progress(args.SessionID, args.TurnID)
 	if err != nil {
 		return chatErr(err.Error())
@@ -123,6 +151,9 @@ func (s *Server) handleAcpClose(
 	_ *sdk.CallToolRequest,
 	args acpSessionIDArgs,
 ) (*sdk.CallToolResult, toolResult, error) {
+	if err := validateSessionID(args.SessionID); err != nil {
+		return failResult(err.Error())
+	}
 	if err := s.manager.CloseSession(ctx, args.SessionID); err != nil {
 		return failResult(err.Error())
 	}
@@ -163,6 +194,9 @@ func (s *Server) handleAcpSessionInfo(
 	_ *sdk.CallToolRequest,
 	args acpSessionIDArgs,
 ) (*sdk.CallToolResult, sessionInfoResult, error) {
+	if err := validateSessionID(args.SessionID); err != nil {
+		return &sdk.CallToolResult{IsError: true}, sessionInfoResult{Status: "error", Error: err.Error()}, nil
+	}
 	view, err := s.manager.Session(args.SessionID)
 	if err != nil {
 		return &sdk.CallToolResult{IsError: true}, sessionInfoResult{Status: "error", Error: err.Error()}, nil
@@ -198,6 +232,9 @@ func (s *Server) handleAcpSetMode(
 	_ *sdk.CallToolRequest,
 	args acpSetModeArgs,
 ) (*sdk.CallToolResult, toolResult, error) {
+	if err := validateSessionID(args.SessionID); err != nil {
+		return failResult(err.Error())
+	}
 	view, err := s.manager.SetMode(ctx, args.SessionID, args.Mode)
 	if err != nil {
 		return failResult(err.Error())
@@ -210,6 +247,9 @@ func (s *Server) handleAcpSetConfig(
 	_ *sdk.CallToolRequest,
 	args acpSetConfigArgs,
 ) (*sdk.CallToolResult, toolResult, error) {
+	if err := validateSessionID(args.SessionID); err != nil {
+		return failResult(err.Error())
+	}
 	if err := s.manager.SetConfig(ctx, args.SessionID, args.ConfigID, args.Value); err != nil {
 		return failResult(err.Error())
 	}
@@ -221,6 +261,9 @@ func (s *Server) handleAcpForkSession(
 	_ *sdk.CallToolRequest,
 	args acpSessionIDArgs,
 ) (*sdk.CallToolResult, toolResult, error) {
+	if err := validateSessionID(args.SessionID); err != nil {
+		return failResult(err.Error())
+	}
 	view, err := s.manager.ForkSession(ctx, args.SessionID)
 	if err != nil {
 		return failResult(err.Error())

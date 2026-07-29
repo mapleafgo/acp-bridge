@@ -2,6 +2,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -256,6 +257,26 @@ func TestStart_BinaryNotFound(t *testing.T) {
 	}
 }
 
+func TestDriverStartErrorIncludesAgentType(t *testing.T) {
+	tests := map[AgentType]AgentDriver{
+		AgentTypeCodex:  &CodexDriver{path: "/nonexistent/codex-binary-xyz789"},
+		AgentTypeClaude: &ClaudeDriver{path: "/nonexistent/claude-binary-xyz789"},
+		AgentTypeGemini: &GeminiDriver{path: "/nonexistent/gemini-binary-xyz789"},
+	}
+	for agentType, drv := range tests {
+		t.Run(string(agentType), func(t *testing.T) {
+			_, err := drv.Start(context.Background())
+			var startErr *StartError
+			if !errors.As(err, &startErr) {
+				t.Fatalf("expected StartError, got %T: %v", err, err)
+			}
+			if startErr.AgentType != agentType {
+				t.Fatalf("AgentType = %q, want %q", startErr.AgentType, agentType)
+			}
+		})
+	}
+}
+
 // ---------------------------------------------------------------------------
 // buildCmd 单元测试
 // ---------------------------------------------------------------------------
@@ -318,7 +339,7 @@ func TestBuildCmd_PassesInitialAgentMode(t *testing.T) {
 
 func TestBuildCmd_NoInitialAgentMode(t *testing.T) {
 	// Ensure the env var is not set
-	os.Unsetenv("INITIAL_AGENT_MODE")
+	_ = os.Unsetenv("INITIAL_AGENT_MODE")
 
 	cmd, err := buildCmd(context.Background(), "/bin/echo", nil)
 	if err != nil {
@@ -336,6 +357,22 @@ func TestBuildCmd_NoInitialAgentMode(t *testing.T) {
 }
 
 // --- Start methods for claude and gemini drivers ---
+
+func TestCommandStringDriversStart(t *testing.T) {
+	tests := map[string]AgentDriver{
+		"claude": &ClaudeDriver{path: "sh -c true"},
+		"gemini": &GeminiDriver{path: "sh -c true"},
+	}
+	for name, drv := range tests {
+		t.Run(name, func(t *testing.T) {
+			process, err := drv.Start(context.Background())
+			if err != nil {
+				t.Fatalf("Start() error = %v", err)
+			}
+			<-process.Done()
+		})
+	}
+}
 
 func TestClaudeDriver_StartBinaryNotFound(t *testing.T) {
 	d := &ClaudeDriver{

@@ -30,7 +30,7 @@ func TestToolsViaInMemoryTransport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer connection.Close()
+	defer func() { _ = connection.Close() }()
 
 	tools, err := connection.ListTools(ctx, &sdk.ListToolsParams{})
 	if err != nil {
@@ -71,7 +71,7 @@ func TestSkillResourceIsEmbedded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer connection.Close()
+	defer func() { _ = connection.Close() }()
 
 	result, err := connection.ReadResource(ctx, &sdk.ReadResourceParams{URI: skillResourceURI})
 	if err != nil || len(result.Contents) != 1 {

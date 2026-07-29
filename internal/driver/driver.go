@@ -4,6 +4,7 @@ package driver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -53,6 +54,7 @@ type StartError struct {
 	Err       error
 }
 
+// Error 返回包含 agent 类型、命令路径、退出码和 stderr 的启动诊断。
 func (e *StartError) Error() string {
 	return fmt.Sprintf("failed to start %s agent (path=%s, exit=%d): %s\nstderr: %s",
 		e.AgentType, e.Path, e.ExitCode, e.Err, e.Stderr)
@@ -83,6 +85,25 @@ func NewDriver(agentType AgentType, cfg *config.Config) (AgentDriver, error) {
 	default:
 		return nil, fmt.Errorf("unknown agent type: %s", agentType)
 	}
+}
+
+func startAgentProcess(
+	ctx context.Context,
+	agentType AgentType,
+	exe string,
+	args []string,
+) (AgentProcess, error) {
+	process, err := startProcess(ctx, exe, args)
+	if err == nil {
+		return process, nil
+	}
+	var startErr *StartError
+	if errors.As(err, &startErr) {
+		annotated := *startErr
+		annotated.AgentType = agentType
+		return nil, &annotated
+	}
+	return nil, fmt.Errorf("failed to start %s agent: %w", agentType, err)
 }
 
 // buildCmd constructs an exec.Cmd with binary existence checking and

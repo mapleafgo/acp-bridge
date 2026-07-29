@@ -26,5 +26,6 @@ type ACPClient interface {
 	PermissionEvents(string) <-chan client.PermissionEvent
 	ForgetSession(string)
 	Done() <-chan struct{}
+	Err() error
 	Close(context.Context) error
 }

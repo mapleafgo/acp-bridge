@@ -8,6 +8,8 @@ import (
 	"github.com/mapleafgo/acp-bridge/internal/session"
 )
 
+// AgentInstance 保存单一 agent 进程、generation 和其拥有的全部活跃 Session。
+// 实例只由 Manager 创建和销毁，内部 Session 索引可并发访问。
 type AgentInstance struct {
 	mu sync.Mutex
 
@@ -36,13 +38,6 @@ func (i *AgentInstance) addSession(sessionID string, sess *session.Session) erro
 	}
 	i.sessions[sessionID] = sess
 	return nil
-}
-
-func (i *AgentInstance) getSession(sessionID string) (*session.Session, bool) {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	sess, ok := i.sessions[sessionID]
-	return sess, ok
 }
 
 func (i *AgentInstance) removeSession(sessionID string) *session.Session {

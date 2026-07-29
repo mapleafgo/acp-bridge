@@ -5,14 +5,6 @@ import (
 	"time"
 )
 
-// --- Helpers ---
-
-func setEnv(t *testing.T, key, val string) func() {
-	t.Helper()
-	t.Setenv(key, val)
-	return func() {}
-}
-
 // --- Default values ---
 
 func TestLoadDefaults(t *testing.T) {

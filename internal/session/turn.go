@@ -21,17 +21,22 @@ const (
 )
 
 var (
-	ErrTurnNotFound   = errors.New("turn not found")
-	ErrTurnMismatch   = errors.New("turn ID does not match current turn")
+	// ErrTurnNotFound 表示 Session 尚未产生任何 Turn。
+	ErrTurnNotFound = errors.New("turn not found")
+	// ErrTurnMismatch 表示请求的 Turn ID 不是 Session 当前或最近的 Turn。
+	ErrTurnMismatch = errors.New("turn mismatch")
+	// ErrPermissionGone 表示权限请求已处理、被中断或不属于当前 Turn。
 	ErrPermissionGone = errors.New("permission request is no longer pending")
 )
 
+// PermissionOption 是权限请求中可选择的一个 agent 决策。
 type PermissionOption struct {
 	ID   string
 	Name string
 	Kind string
 }
 
+// PermissionView 是等待用户决定的权限请求值快照。
 type PermissionView struct {
 	RequestID  string
 	ToolCallID string
@@ -40,6 +45,7 @@ type PermissionView struct {
 	Options    []PermissionOption
 }
 
+// ToolCall 是 Turn 中 agent 工具调用的结构化快照。
 type ToolCall struct {
 	ID        string
 	Title     string
@@ -50,17 +56,20 @@ type ToolCall struct {
 	RawOutput any
 }
 
+// PlanStep 是 Turn 计划中的单个步骤。
 type PlanStep struct {
 	Content  string
 	Status   string
 	Priority string
 }
 
+// FileChange 是 agent 报告的单个文件变更。
 type FileChange struct {
 	Path string
 	Kind string
 }
 
+// Usage 是 agent 报告的 Token 和费用快照。
 type Usage struct {
 	UsedTokens  int
 	TotalTokens int
@@ -103,6 +112,7 @@ type Turn struct {
 	finishOnce  sync.Once
 }
 
+// NewTurn 创建 running Turn；cancel 为 nil 时使用空操作，避免调用方判空。
 func NewTurn(id string, cancel context.CancelFunc) *Turn {
 	if cancel == nil {
 		cancel = func() {}
@@ -116,22 +126,26 @@ func NewTurn(id string, cancel context.CancelFunc) *Turn {
 	}
 }
 
+// ControllerDone 返回在唯一 controller 退出时关闭的 channel。
 func (t *Turn) ControllerDone() <-chan struct{} {
 	return t.controller
 }
 
+// FinishController 幂等标记 Turn controller 已退出。
 func (t *Turn) FinishController() {
 	t.finishOnce.Do(func() {
 		close(t.controller)
 	})
 }
 
+// ID 返回此 Turn 的稳定标识。
 func (t *Turn) ID() string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.id
 }
 
+// Snapshot 返回包含权限队列当前项和累计输出的深拷贝值快照。
 func (t *Turn) Snapshot() TurnView {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -151,6 +165,7 @@ func (t *Turn) snapshotLocked() TurnView {
 	return view
 }
 
+// RequirePermission 将权限请求设为当前项或追加到 FIFO 队列；终态 Turn 返回 false。
 func (t *Turn) RequirePermission(permission PermissionView) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -168,6 +183,7 @@ func (t *Turn) RequirePermission(permission PermissionView) bool {
 	return true
 }
 
+// ResolvePermission 移除匹配的当前权限请求，并切换到下一个请求或 running。
 func (t *Turn) ResolvePermission(requestID string) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -187,14 +203,17 @@ func (t *Turn) ResolvePermission(requestID string) error {
 	return nil
 }
 
+// Complete 原子提交 completed 终态；已有终态时返回 false。
 func (t *Turn) Complete(snapshot TurnSnapshot) bool {
 	return t.finish(TurnCompleted, snapshot)
 }
 
+// Interrupt 原子提交 interrupted 终态；已有终态时返回 false。
 func (t *Turn) Interrupt(snapshot TurnSnapshot) bool {
 	return t.finish(TurnInterrupted, snapshot)
 }
 
+// Fail 原子提交 error 终态；已有终态时返回 false。
 func (t *Turn) Fail(snapshot TurnSnapshot) bool {
 	return t.finish(TurnError, snapshot)
 }
@@ -213,6 +232,7 @@ func (t *Turn) finish(state TurnState, snapshot TurnSnapshot) bool {
 	return true
 }
 
+// Cancel 请求底层 Prompt 停止；终态提交仍由 controller 或 lifecycle owner 完成。
 func (t *Turn) Cancel() {
 	t.mu.Lock()
 	cancel := t.cancel

@@ -295,6 +295,14 @@ func (c *Client) Done() <-chan struct{} {
 	return c.done
 }
 
+// Err 返回 agent 子进程的退出错误；Done 尚未关闭或进程正常退出时返回 nil。
+func (c *Client) Err() error {
+	if c.process == nil {
+		return nil
+	}
+	return c.process.Err()
+}
+
 func (c *Client) watchDone() {
 	select {
 	case <-c.conn.Done():

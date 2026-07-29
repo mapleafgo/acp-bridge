@@ -8,7 +8,7 @@ import (
 )
 
 // ErrInvalidSessionID 表示公开 Session ID 不符合 <agent_type>:<agent_session_id> 格式。
-var ErrInvalidSessionID = errors.New("invalid qualified session ID")
+var ErrInvalidSessionID = errors.New("invalid session_id")
 
 // ID 是 bridge 对外暴露的限定 Session ID。
 type ID struct {

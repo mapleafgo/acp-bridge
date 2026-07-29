@@ -9,11 +9,17 @@ import (
 
 // AgentProcess 是 agent 子进程的完整所有权边界。
 type AgentProcess interface {
+	// Stdin 返回只归 ACP Client 使用的进程标准输入。
 	Stdin() io.WriteCloser
+	// Stdout 返回只归 ACP Client 使用的进程标准输出。
 	Stdout() io.ReadCloser
+	// Stderr 返回调用方必须持续消费或关闭的进程标准错误。
 	Stderr() io.ReadCloser
+	// Done 在唯一 Wait goroutine 回收进程后关闭。
 	Done() <-chan struct{}
+	// Err 在 Done 关闭后返回 cmd.Wait 的结果；进程仍运行或正常退出时为 nil。
 	Err() error
+	// Close 幂等请求进程退出，并在 ctx 到期时强制终止后等待回收。
 	Close(context.Context) error
 }
 

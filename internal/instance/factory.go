@@ -9,6 +9,7 @@ import (
 	"github.com/mapleafgo/acp-bridge/internal/driver"
 )
 
+// ClientFactory 在 Manager 生命周期 context 下创建指定类型的完整 ACP Client。
 type ClientFactory func(context.Context, driver.AgentType) (ACPClient, error)
 
 // DefaultFactory 构造生产环境 ACP Client。

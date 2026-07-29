@@ -21,13 +21,16 @@ type CodexDriver struct {
 	args []string // additional driver-specific arguments
 }
 
+// Type 返回该 Driver 管理的 codex agent 类型。
 func (d *CodexDriver) Type() AgentType { return AgentTypeCodex }
 
+// Start 启动配置的 codex-acp 命令；返回对象独占子进程回收职责。
 func (d *CodexDriver) Start(ctx context.Context) (AgentProcess, error) {
 	exe, initialArgs := splitCommand(d.path)
-	return startProcess(ctx, exe, append(initialArgs, d.args...))
+	return startAgentProcess(ctx, d.Type(), exe, append(initialArgs, d.args...))
 }
 
+// Capabilities 返回 codex-acp 当前接入的 ACP 扩展能力集合。
 func (d *CodexDriver) Capabilities() AgentCapabilities {
 	return defaultCapabilities()
 }
