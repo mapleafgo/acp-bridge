@@ -959,6 +959,129 @@ func TestSetModeRejectsResponseAfterSessionWasDetached(t *testing.T) {
 	}
 }
 
+func TestSetConfigRejectsResponseAfterSessionWasDetached(t *testing.T) {
+	cl := newFakeClient()
+	manager := NewManager(testConfig(10), func(context.Context, driver.AgentType) (ACPClient, error) {
+		return cl, nil
+	})
+	t.Cleanup(func() { _ = manager.Close(context.Background()) })
+	created, err := manager.CreateSession(context.Background(), driver.AgentTypeCodex, "/tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	setConfigStarted := make(chan struct{})
+	releaseSetConfig := make(chan struct{})
+	cl.setConfigFn = func(context.Context, string, string, string) error {
+		close(setConfigStarted)
+		<-releaseSetConfig
+		return nil
+	}
+
+	setConfigDone := make(chan error, 1)
+	go func() {
+		setConfigDone <- manager.SetConfig(context.Background(), created.ID.String(), "model", "gpt-4")
+	}()
+	<-setConfigStarted
+	cl.closeOne.Do(func() { close(cl.done) })
+	waitForSessionCount(t, manager, 0)
+	close(releaseSetConfig)
+	if err := <-setConfigDone; !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("expected ErrSessionNotFound, got %v", err)
+	}
+}
+
+func TestDetachInstanceIgnoresStaleGeneration(t *testing.T) {
+	factory := newFakeFactory()
+	manager := NewManager(testConfig(10), factory.New)
+	t.Cleanup(func() { _ = manager.Close(context.Background()) })
+
+	if _, err := manager.CreateSession(context.Background(), driver.AgentTypeCodex, "/tmp"); err != nil {
+		t.Fatal(err)
+	}
+	manager.mu.Lock()
+	stale := manager.instances[driver.AgentTypeCodex].instance
+	manager.mu.Unlock()
+
+	factory.clients[driver.AgentTypeCodex].closeOne.Do(func() {
+		close(factory.clients[driver.AgentTypeCodex].done)
+	})
+	waitForInstanceAbsent(t, manager, driver.AgentTypeCodex)
+
+	created, err := manager.CreateSession(context.Background(), driver.AgentTypeCodex, "/tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sessions := manager.detachInstance(stale); len(sessions) != 0 {
+		t.Fatalf("stale detach removed sessions: %#v", sessions)
+	}
+	views := manager.Sessions()
+	if len(views) != 1 || views[0].ID.String() != created.ID.String() {
+		t.Fatalf("new instance sessions corrupted: %#v", views)
+	}
+}
+
+func TestDifferentSessionsPromptConcurrently(t *testing.T) {
+	factory := newFakeFactory()
+	manager := NewManager(testConfig(10), factory.New)
+	t.Cleanup(func() { _ = manager.Close(context.Background()) })
+	first, err := manager.CreateSession(context.Background(), driver.AgentTypeCodex, "/tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := manager.CreateSession(context.Background(), driver.AgentTypeCodex, "/tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	errs := make(chan error, 2)
+	for _, id := range []string{first.ID.String(), second.ID.String()} {
+		go func(qualifiedID string) {
+			_, err := manager.Chat(context.Background(), qualifiedID, "parallel", time.Second)
+			errs <- err
+		}(id)
+	}
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("concurrent chat failed: %v", err)
+		}
+	}
+}
+
+func TestResumeCompensatesRemoteSessionWhenInstanceExitsBeforeRegister(t *testing.T) {
+	cl := newFakeClient()
+	resumeStarted := make(chan struct{})
+	releaseResume := make(chan struct{})
+	cl.resumeFn = func(context.Context, string, string) (*acp.ResumeSessionResponse, error) {
+		close(resumeStarted)
+		<-releaseResume
+		return &acp.ResumeSessionResponse{}, nil
+	}
+	manager := NewManager(testConfig(10), func(context.Context, driver.AgentType) (ACPClient, error) {
+		return cl, nil
+	})
+	t.Cleanup(func() { _ = manager.Close(context.Background()) })
+	id := session.ID{AgentType: driver.AgentTypeCodex, AgentSessionID: "history-1"}
+
+	resumeDone := make(chan error, 1)
+	go func() {
+		_, err := manager.ResumeSession(context.Background(), id, "/tmp")
+		resumeDone <- err
+	}()
+	<-resumeStarted
+	cl.closeOne.Do(func() { close(cl.done) })
+	waitForInstanceAbsent(t, manager, driver.AgentTypeCodex)
+	close(releaseResume)
+	if err := <-resumeDone; !errors.Is(err, ErrInstanceChanged) {
+		t.Fatalf("expected ErrInstanceChanged, got %v", err)
+	}
+	cl.mu.Lock()
+	closeCalls := append([]string(nil), cl.closeSessionCalls...)
+	cl.mu.Unlock()
+	if !containsString(closeCalls, id.AgentSessionID) {
+		t.Fatalf("resumed remote session was not closed after register failure: %v", closeCalls)
+	}
+}
+
 func TestSetModeLogsLifecycleOutcome(t *testing.T) {
 	var logs bytes.Buffer
 	previousLogger := slog.Default()

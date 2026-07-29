@@ -169,8 +169,10 @@ func (s *Server) handleAcpSessions(
 	items := make([]sessionListItem, 0, len(views))
 	now := time.Now()
 	for _, view := range views {
+		turnID := ""
 		turnStatus := ""
 		if view.Turn != nil {
+			turnID = view.Turn.ID
 			turnStatus = string(view.Turn.State)
 		}
 		items = append(items, sessionListItem{
@@ -178,6 +180,7 @@ func (s *Server) handleAcpSessions(
 			AgentType:   string(view.ID.AgentType),
 			State:       string(view.State),
 			Status:      "active",
+			TurnID:      turnID,
 			TurnStatus:  turnStatus,
 			TurnCount:   view.TurnCount,
 			IdleSeconds: max(0, int(now.Sub(view.LastUsed).Seconds())),

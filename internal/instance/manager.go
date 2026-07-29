@@ -460,6 +460,7 @@ func (m *Manager) Sessions() []session.SessionView {
 }
 
 // History 查询指定 agent 的持久化 Session 列表；该操作可能惰性启动实例。
+// 远端列表一旦成功即返回数据；即使随后实例退出也不改为错误。
 func (m *Manager) History(ctx context.Context, agentType driver.AgentType) ([]acp.SessionInfo, error) {
 	startedAt := time.Now()
 	inst, err := m.getInstance(ctx, agentType)

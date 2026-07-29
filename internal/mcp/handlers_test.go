@@ -28,6 +28,7 @@ type testACPClient struct {
 	resumeCalls       []string
 	deleteCalls       []string
 	closeSessionCalls []string
+	promptFn          func(context.Context, string, []acp.ContentBlock) (*acp.PromptResponse, error)
 	updates           map[string][]acp.SessionNotification
 	permissionEvents  map[string]chan client.PermissionEvent
 }
@@ -49,15 +50,51 @@ func (c *testACPClient) NewSession(context.Context, string) (*acp.NewSessionResp
 	if c.next == 1 {
 		id = c.firstSessionID
 	}
-	return &acp.NewSessionResponse{SessionId: acp.SessionId(id)}, nil
+	return &acp.NewSessionResponse{
+		SessionId: acp.SessionId(id),
+		Modes: &acp.SessionModeState{
+			CurrentModeId:  "default",
+			AvailableModes: []acp.SessionMode{},
+		},
+		ConfigOptions: []acp.SessionConfigOption{{
+			Select: &acp.SessionConfigOptionSelect{
+				Id:           "model",
+				Name:         "Model",
+				Type:         "select",
+				CurrentValue: "gpt-5",
+			},
+		}},
+	}, nil
 }
 
-func (c *testACPClient) Prompt(_ context.Context, sessionID string, _ []acp.ContentBlock) (*acp.PromptResponse, error) {
+func (c *testACPClient) Prompt(ctx context.Context, sessionID string, blocks []acp.ContentBlock) (*acp.PromptResponse, error) {
+	if c.promptFn != nil {
+		return c.promptFn(ctx, sessionID, blocks)
+	}
 	c.mu.Lock()
-	c.updates[sessionID] = append(c.updates[sessionID], acp.SessionNotification{
-		SessionId: acp.SessionId(sessionID),
-		Update:    acp.UpdateAgentMessageText("完成"),
-	})
+	title := "演示会话"
+	c.updates[sessionID] = append(c.updates[sessionID],
+		acp.SessionNotification{
+			SessionId: acp.SessionId(sessionID),
+			Update: acp.SessionUpdate{
+				SessionInfoUpdate: &acp.SessionSessionInfoUpdate{Title: &title},
+			},
+		},
+		acp.SessionNotification{
+			SessionId: acp.SessionId(sessionID),
+			Update: acp.SessionUpdate{
+				AvailableCommandsUpdate: &acp.SessionAvailableCommandsUpdate{
+					AvailableCommands: []acp.AvailableCommand{
+						{Name: "/plan", Description: "制定计划"},
+					},
+				},
+			},
+		},
+		acp.SessionNotification{
+			SessionId: acp.SessionId(sessionID),
+			Update:    acp.UpdateAgentMessageText("完成"),
+		},
+	)
 	c.mu.Unlock()
 	return &acp.PromptResponse{StopReason: acp.StopReasonEndTurn}, nil
 }
@@ -249,6 +286,79 @@ func TestAcpSessionsReturnsAllItems(t *testing.T) {
 		if item.SessionID == "" {
 			t.Fatal("session_id must not be empty")
 		}
+		if item.TurnID != "" || item.TurnStatus != "" {
+			t.Fatalf("idle session should not expose turn fields: %#v", item)
+		}
+	}
+}
+
+func TestAcpSessionsExposesTurnNavigationFields(t *testing.T) {
+	cfg := &config.Config{MaxSessions: 10, DefaultTimeout: 30 * time.Millisecond}
+	factory := newTestFactory()
+	manager := instance.NewManager(cfg, factory.New)
+	t.Cleanup(func() { _ = manager.Close(context.Background()) })
+	server := NewServer(cfg, manager)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	created, err := manager.CreateSession(context.Background(), driver.AgentTypeCodex, "/tmp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl := factory.clients[driver.AgentTypeCodex]
+	cl.promptFn = func(ctx context.Context, _ string, _ []acp.ContentBlock) (*acp.PromptResponse, error) {
+		close(started)
+		<-release
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+
+	chatDone := make(chan chatResultJSON, 1)
+	go func() {
+		_, out, _ := server.handleAcpChat(context.Background(), nil, acpChatArgs{
+			Prompt:    "长时间任务",
+			SessionID: created.ID.String(),
+		})
+		chatDone <- out
+	}()
+	<-started
+
+	_, listed, err := server.handleAcpSessions(context.Background(), nil, struct{}{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed.Sessions) != 1 {
+		t.Fatalf("sessions=%d", len(listed.Sessions))
+	}
+	item := listed.Sessions[0]
+	if item.TurnID == "" || item.TurnStatus != string(session.TurnRunning) || item.State != string(session.StatePrompting) {
+		t.Fatalf("running list item=%#v", item)
+	}
+	turnID := item.TurnID
+
+	chat := <-chatDone
+	if chat.TurnID != turnID || chat.Status != string(instance.StatusRunning) {
+		t.Fatalf("chat result=%#v, want running turn %s", chat, turnID)
+	}
+
+	_, interrupted, err := server.handleAcpInterrupt(context.Background(), nil, acpTurnArgs{
+		SessionID: created.ID.String(),
+		TurnID:    turnID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if interrupted.Status != string(instance.StatusInterrupted) {
+		t.Fatalf("interrupt result=%#v", interrupted)
+	}
+	close(release)
+
+	_, listed, err = server.handleAcpSessions(context.Background(), nil, struct{}{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	item = listed.Sessions[0]
+	if item.TurnID != turnID || item.TurnStatus != string(session.TurnInterrupted) || item.State != string(session.StateIdle) {
+		t.Fatalf("interrupted list item=%#v", item)
 	}
 }
 
@@ -327,6 +437,86 @@ func TestAcpForkAndCloseSession(t *testing.T) {
 	}
 }
 
+func TestAcpSessionInfoRequiresValidSessionID(t *testing.T) {
+	server, _, _ := newTestServer(t, 10)
+	result, out, err := server.handleAcpSessionInfo(context.Background(), nil, acpSessionIDArgs{})
+	if err != nil || !result.IsError || out.Error != "session_id is required" {
+		t.Fatalf("empty id result=%#v out=%#v err=%v", result, out, err)
+	}
+	result, out, err = server.handleAcpSessionInfo(context.Background(), nil, acpSessionIDArgs{SessionID: "not-qualified"})
+	if err != nil || !result.IsError || out.Status != "error" {
+		t.Fatalf("invalid id result=%#v out=%#v err=%v", result, out, err)
+	}
+}
+
+func TestAcpSessionInfoNotFound(t *testing.T) {
+	server, _, _ := newTestServer(t, 10)
+	result, out, err := server.handleAcpSessionInfo(context.Background(), nil, acpSessionIDArgs{
+		SessionID: "codex:missing",
+	})
+	if err != nil || !result.IsError || out.Status != "error" || out.Error == "" {
+		t.Fatalf("result=%#v out=%#v err=%v", result, out, err)
+	}
+}
+
+func TestAcpSessionInfoReturnsSessionMetadata(t *testing.T) {
+	server, manager, _ := newTestServer(t, 10)
+	created, err := manager.CreateSession(context.Background(), driver.AgentTypeCodex, "/tmp/demo")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, out, err := server.handleAcpSessionInfo(context.Background(), nil, acpSessionIDArgs{
+		SessionID: created.ID.String(),
+	})
+	if err != nil || result.IsError {
+		t.Fatalf("result=%#v out=%#v err=%v", result, out, err)
+	}
+	if out.Status != "ok" || out.SessionID != created.ID.String() || out.AgentType != "codex" {
+		t.Fatalf("identity fields: %#v", out)
+	}
+	if out.State != string(session.StateIdle) || out.Cwd != "/tmp/demo" || out.CurrentMode != "default" {
+		t.Fatalf("basic fields: %#v", out)
+	}
+	if len(out.ConfigOptions) != 1 || out.ConfigOptions[0].ID != "model" || out.ConfigOptions[0].Value != "gpt-5" {
+		t.Fatalf("config_options: %#v", out.ConfigOptions)
+	}
+
+	if _, err := manager.SetMode(context.Background(), created.ID.String(), "acceptEdits"); err != nil {
+		t.Fatal(err)
+	}
+	_, chat, err := server.handleAcpChat(context.Background(), nil, acpChatArgs{
+		Prompt:    "整理元数据",
+		SessionID: created.ID.String(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if chat.Status != string(instance.StatusCompleted) {
+		t.Fatalf("chat status=%s", chat.Status)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		result, out, err = server.handleAcpSessionInfo(context.Background(), nil, acpSessionIDArgs{
+			SessionID: created.ID.String(),
+		})
+		if err != nil || result.IsError {
+			t.Fatalf("after chat result=%#v out=%#v err=%v", result, out, err)
+		}
+		if out.CurrentMode == "acceptEdits" && out.Title == "演示会话" && out.TurnCount == 1 && out.State == string(session.StateIdle) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("updated fields not ready: %#v", out)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if len(out.AvailableCommands) != 1 || out.AvailableCommands[0].Name != "/plan" {
+		t.Fatalf("available_commands: %#v", out.AvailableCommands)
+	}
+}
+
 func TestMCPArgumentSchemasUseFinalContracts(t *testing.T) {
 	progressType := reflect.TypeFor[acpProgressArgs]()
 	turnID, _ := progressType.FieldByName("TurnID")
@@ -337,6 +527,10 @@ func TestMCPArgumentSchemasUseFinalContracts(t *testing.T) {
 	sessionID, _ := itemType.FieldByName("SessionID")
 	if got := sessionID.Tag.Get("json"); got != "session_id" {
 		t.Fatalf("SessionID json tag=%q", got)
+	}
+	turnIDField, ok := itemType.FieldByName("TurnID")
+	if !ok || turnIDField.Tag.Get("json") != "turn_id,omitempty" {
+		t.Fatal("sessionListItem must expose turn_id")
 	}
 	if _, ok := reflect.TypeFor[acpListHistoryArgs]().FieldByName("CWD"); ok {
 		t.Fatal("acp_list_history must not expose cwd")

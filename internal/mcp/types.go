@@ -115,6 +115,7 @@ type sessionListItem struct {
 	AgentType   string `json:"agent_type,omitempty"`
 	State       string `json:"state,omitempty"`
 	Status      string `json:"status,omitempty"`
+	TurnID      string `json:"turn_id,omitempty"`
 	TurnStatus  string `json:"turn_status,omitempty"`
 	TurnCount   int    `json:"turn_count,omitempty"`
 	IdleSeconds int    `json:"idle_seconds,omitempty"`

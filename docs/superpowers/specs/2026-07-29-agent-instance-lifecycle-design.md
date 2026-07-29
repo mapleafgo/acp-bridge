@@ -550,8 +550,7 @@ acp_sessions()
       "idle_seconds": 120,
       "current_mode": "default",
       "turn_id": "t-123",
-      "turn_status": "interrupted",
-      "next_action": "acp_chat"
+      "turn_status": "interrupted"
     }
   ]
 }
@@ -562,15 +561,6 @@ acp_sessions()
 `title` 只使用 agent 上报的非空标题。bridge 不根据 Prompt 生成标题。
 
 当前 `Pool.List` 已一次返回全部元素，但 map 遍历无稳定顺序，且 `Pool.Get` 会让只读查询刷新 `LastUsed`。目标保留无分页行为，改为从 Manager 快照生成结果并稳定排序；列表和其他只读查询不再隐式 Touch。
-
-`next_action`：
-
-| Session 状态 | Turn 状态 | next_action |
-|---|---|---|
-| idle | 无、completed、interrupted 或 error | `acp_chat` |
-| prompting | running | `acp_progress` |
-| permission_pending | permission_required | `acp_progress` |
-| closing | 任意 | `none` |
 
 存在当前保留 Turn 时返回 `turn_id` 和 `turn_status`。`acp_sessions` 不返回完整 permission 和 request ID；宿主先调用 `acp_progress(session_id)` 取得权限详情，再调用 `acp_respond`。这样列表只承担发现和导航职责。
 
@@ -634,6 +624,7 @@ MCP stdio 结束或 Server.Run 返回后：
 | load 或 resume 已活跃 Session | `session already active` |
 | delete 活跃 Session | `session is active; close it before deleting` |
 | ACP 调用期间实例退出或被替换 | `agent instance changed during operation` |
+| （例外）delete/history 远端已成功 | 不返回上表错误，按成功处理并记 Warn |
 | `acp_interrupt` 缺少 turn_id | `turn_id is required` |
 | Turn 不存在 | `turn not found` |
 | Turn ID 不匹配 | `turn mismatch` |
@@ -708,7 +699,7 @@ MCP stdio 结束或 Server.Run 返回后：
 1. 无分页参数；
 2. 返回全部活跃 Session；
 3. 返回字段名 `session_id`；
-4. 返回 agent 类型、状态、标题、cwd、Turn 和 next_action；
+4. 返回 agent 类型、状态、标题、cwd、Turn 和 turn_id（有 Turn 时）；
 5. 标题为空时省略；
 6. 按最后活动时间稳定排序；
 7. 调用列表不更新 Session 活动时间；

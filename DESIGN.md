@@ -61,6 +61,7 @@ Session 创建后永久保留，不设置 TTL、不做 LRU，也不会在容量�
 - 拒绝新操作时不会关闭或替换已有 Session。
 
 `acp_sessions()` 不分页，返回当前全部活跃 Session，并按 `last_used` 降序、限定 ID 升序稳定排列。只读查询不刷新 `last_used`。
+列表在存在保留 Turn 时返回 `turn_id`/`turn_status`；宿主根据 `state`/`turn_status` 自行决定下一步工具。
 
 ## 4. Turn 生命周期
 
@@ -86,6 +87,7 @@ Turn 状态为：
 - `acp_progress(session_id)` 查询当前或最近 Turn；
 - 可选 `turn_id` 用于精确校验；
 - 尚无 Turn 时返回 `idle`；
+ - 对于 running 或权限待决的 Turn，它也是获取流式已输出内容与元数据变化的通用只读入口；
 - completed、interrupted 和 error 快照保留到下一轮 chat。
 
 ### 中断
@@ -94,7 +96,7 @@ Turn 状态为：
 
 1. 原子提交 `interrupted` 终态；
 2. 保存中断前通知快照；
-3. Session 回到 idle；
+3. 等待 Turn controller 退出后才挂载中断结果；
 4. 取消本地 Prompt context；
 5. 使用实例生命周期派生的短超时 context 尽力发送 ACP Cancel。
 
@@ -116,6 +118,7 @@ ACP Cancel 失败只记录 Warn，不回滚本地中断。完成与中断并发�
 - `acp_sessions` 无分页参数，返回全部活跃 Session。
 - `acp_list_history` 可选 `agent_type`，默认 codex；返回的历史 ID 同样是限定 ID。
 - `acp_load_session`、`acp_resume_session` 和 `acp_delete_session` 从限定 ID 推导 agent 类型，不再单独接收 `agent_type`。
+- `acp_progress` 是通用只读查询：任意活跃会话随时可调，获取当前或最近 Turn 的状态与完整内容。
 
 所有 handler 使用 MCP SDK 泛型结构化输出。业务错误设置 `CallToolResult.IsError=true`。
 
@@ -124,7 +127,7 @@ ACP Cancel 失败只记录 Warn，不回滚本地中断。完成与中断并发�
 `main.run()` 创建 Manager 和 MCP Server。无论 stdio 正常 EOF 还是 Server 返回错误，`runWith` 都在返回前调用 `Manager.Close`：
 
 1. 标记 Manager closing，拒绝新操作；
-2. 取消所有运行中 Turn；
+2. 中断全部运行中 Turn，关闭全部活跃 Session；
 3. 关闭每个 Client；
 4. Client 关闭 stdin，等待 agent 自行退出；超时后强制终止；
 5. 清空实例与 Session 索引。

@@ -57,12 +57,12 @@ func (s *Server) registerTools() {
 
 	sdk.AddTool(s.sdkServer, &sdk.Tool{
 		Name:        "acp_sessions",
-		Description: "List all active ACP sessions managed by acp-bridge.",
+		Description: "List all active ACP sessions with optional turn_id and turn_status.",
 	}, s.handleAcpSessions)
 
 	sdk.AddTool(s.sdkServer, &sdk.Tool{
 		Name:        "acp_progress",
-		Description: "Check a session's current or most recent turn. turn_id is optional and enables exact-match validation.",
+		Description: "Read any active session's current or most recent turn anytime: status, streamed text/tools/plan, or permission_required. Optional turn_id validates the exact turn.",
 	}, s.handleAcpProgress)
 
 	sdk.AddTool(s.sdkServer, &sdk.Tool{

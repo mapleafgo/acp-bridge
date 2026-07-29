@@ -1,127 +1,120 @@
 ---
 name: acp-bridge
-description: Use when delegating coding tasks to a subagent (Codex, Claude, Gemini, or OpenCode) via ACP, when acp_chat returns status running, when an agent requests permission approval, or when managing agent sessions (fork, resume, load history)
+description: Use when calling acp_* tools to work with Codex/Claude/Gemini/OpenCode, when checking any active session with acp_progress, when status is running or permission_required, when choosing the next acp_* call, or when managing sessions and history.
 ---
 
 # acp-bridge
 
 ## Overview
 
-acp-bridge 暴露 14 个 MCP 工具（`acp_*` 前缀），用于将编码任务委托给 ACP 兼容的子 agent 后端（codex / claude / gemini / opencode）。所有返回值都是结构化 JSON。
+用 `acp_*` 工具把任务交给子 agent。**只根据工具返回的 `session_id` / `turn_id` / `status`（以及列表里的 `state` / `turn_status`）决定下一步**。`acp_progress` 可在任意时刻查询任意活跃会话，不限于「刚 chat 完在轮询」。
 
 ## When to Use
 
-- 需要委托子 agent 执行编码任务
-- `acp_chat` 返回 `status: running` 需要轮询结果
-- agent 返回 `permission_required` 需要审批
-- 需要查看 agent 支持的配置项、slash 命令、权限模式
+- 发 prompt、续聊、中断、关闭会话
+- 想查看某个活跃会话当前在做什么、已有哪些输出或是否在等权限 → `acp_progress`
+- 收到 `running` 或 `permission_required`
+- 从返回状态选择下一个 `acp_*`
+- 列活跃会话、查 session 元数据、fork / load / resume / delete 历史
 
 ## When NOT to Use
 
-- 自己能直接完成的简单编码任务
-- 纯文件读写或搜索
+- 不需要子 agent 的本地读写或搜索
 
-## Quick Reference
+## ID 规则
 
-| 工具 | 参数 | 用途 |
-|------|------|------|
-| `acp_chat` | prompt, session_id?, cwd?, agent_type? | 发送 prompt，等待结果 |
-| `acp_respond` | session_id, request_id, outcome | 回复权限请求（allow/deny） |
-| `acp_progress` | session_id, turn_id? | 查询当前或最近 turn；无 turn 时返回 idle |
-| `acp_interrupt` | session_id, turn_id | 中断当前 turn（session 保持存活） |
-| `acp_close` | session_id | 关闭并释放 session |
-| `acp_sessions` | — | 列出活跃 session |
-| `acp_session_info` | session_id | 查看 config_options、available_commands、mode 等 |
-| `acp_set_mode` | session_id, mode | 设置权限模式 |
-| `acp_set_config` | session_id, config_id, value | 设置配置项（model、reasoning_effort 等） |
-| `acp_fork_session` | session_id | 分支会话 |
-| `acp_load_session` | session_id, cwd? | 加载持久化会话 |
-| `acp_resume_session` | session_id, cwd? | 恢复已关闭会话 |
-| `acp_list_history` | agent_type? | 列出指定 agent 的历史会话 |
-| `acp_delete_session` | session_id | 删除持久化会话 |
+- 所有会话 ID 形如 `<agent_type>:<agent_session_id>`（例如 `codex:thread-1`）
+- 新建：省略 `session_id`，从返回值里取
+- 续聊 / progress / interrupt / close / info / set_* / fork：只传该 ID
+- load / resume / delete：只传 qualified ID（不要另传 `agent_type`）
+- 默认：`agent_type=codex`，`cwd=.`（仅新建时有意义）
 
-默认值：`agent_type` 默认 `codex`，`cwd` 默认 `.`。
+## 返回 status → 下一步
 
-## acp_chat 返回值
+| 返回 | 你要做的 |
+|------|----------|
+| `completed` / `error` / `interrupted` | 读结果；可同 `session_id` 再 `acp_chat`，或 `acp_close` |
+| `running` | **马上**保存 `session_id`+`turn_id`，建立跟踪，之后用 `acp_progress` 轮询 |
+| `permission_required` | `acp_respond(session_id, request_id, allow\|deny)` |
+| `idle` | 尚无 turn 或可开新一轮 → 需要时 `acp_chat` |
 
-三种 `status`：
+列表 `acp_sessions` 辅助判断：
 
-**`completed`** — agent 完成。关键字段：`agent_text`、`reasoning`、`tool_calls`（含 raw_input/raw_output/kind/status/locations）、`plan`（含 content/status/priority）、`file_changes`（path/kind=created|modified）、`usage`（used_tokens/total_tokens/cost）、`stop_reason`、`turn_count`。
+| `state` / `turn_status` | 下一步 |
+|-------------------------|--------|
+| `idle` | `acp_chat` |
+| `prompting` + `running` | `acp_progress`；要停则 `acp_interrupt(session_id, turn_id)` |
+| `permission_pending` | `acp_progress` 取 `request_id` → `acp_respond` |
+| `closing` | 不要再 chat |
 
-**`permission_required`** — agent 需要审批。返回 `request_id` 和 `permission`（含 tool_call_id、title、kind、options）。调用 `acp_respond` 回复。
+**没有 `next_action` 字段。** 同一 `session_id` 上不要并发两个 prompt（会 `session busy`）。
 
-**`running`** — 超时未完成，agent 仍在后台执行。返回已有进度快照（agent_text/reasoning/tool_calls/plan）+ session_id + turn_id。
+## 工具怎么用
 
-`acp_progress` 返回结构与 `acp_chat` 完全一致。只传 `session_id` 时查询当前或最近 turn；额外传 `turn_id` 时执行精确校验。Session 尚无 turn 时返回 `idle`。`completed` 和 `interrupted` 会保留到同一 session 的下一次 `acp_chat`。
+| 工具 | 何时用 | 关键参数 |
+|------|--------|----------|
+| `acp_chat` | 新任务或续聊 | `prompt`；续聊加 `session_id`；新建可加 `cwd`/`agent_type` |
+| `acp_progress` | **随时**看会话：状态、本轮/最近一轮内容与进度 | `session_id`（必填）；`turn_id?` 精确校验某一轮 |
+| `acp_respond` | 审批工具调用 | `session_id`，`request_id`，`outcome=allow\|deny` |
+| `acp_interrupt` | 停当前这一轮 | `session_id` + **`turn_id`（必填）**；会话仍在，可再 chat |
+| `acp_close` | 结束并释放会话 | `session_id` |
+| `acp_sessions` | 看有哪些活跃会话 | 无参数；可能带 `turn_id`/`turn_status` |
+| `acp_session_info` | 看 mode / 配置项 / 命令 | `session_id` |
+| `acp_set_mode` | 改权限模式 | `session_id`，`mode` |
+| `acp_set_config` | 改配置（如 model） | `session_id`，`config_id`，`value` |
+| `acp_fork_session` | 从现有会话分出新会话 | 活跃 `session_id` → 新 ID |
+| `acp_list_history` | 列历史 | 可选 `agent_type`（默认 codex） |
+| `acp_load_session` | 把历史加载成活跃 | qualified `session_id`，可选 `cwd` |
+| `acp_resume_session` | 恢复已关闭历史 | 同上 |
+| `acp_delete_session` | 删历史 | 仅非活跃；活跃须先 `acp_close` |
 
-## Core Pattern: running 必须建 todo
+业务失败时看结构化 `error`（`IsError=true`）。
 
-收到 `running` 时 **必须立即创建 todo**，否则会遗忘正在执行的 agent 任务：
+## 推荐调用序列
 
-```
-1. acp_chat → status: running, session_id: "codex:thread-1", turn_id: "t-1"
-2. 创建 todo: [codex:thread-1/t-1] <任务描述> — 调 acp_progress 取结果
-3. acp_progress(session_id: "codex:thread-1", turn_id: "t-1")
-   → completed:           读取结果，勾掉 todo
-   → interrupted:         读取中断前快照，勾掉 todo
-   → running:             继续等待，稍后再查
-   → permission_required: 调 acp_respond
-```
-
-todo 必须同时包含 `session_id` 和 `turn_id`。轮询间隔不需要太短——复杂任务通常需要数分钟。
-
-## Core Pattern: 权限审批
-
-权限请求可能出现在两个地方——`acp_chat` 和 `acp_progress` 的返回值中：
-
-```
-acp_chat / acp_progress → permission_required, request_id: "tc-1"
-acp_respond(session_id, request_id: "tc-1", outcome: "allow"|"deny")
-→ completed | permission_required | running
-```
-
-`acp_respond` 后同样等待超时，可能再次返回 `running`——此时同样需要建 todo 轮询。
-
-## Core Pattern: 多轮对话
-
-首次调用省略 `session_id` 创建新 session，后续调用传入 `session_id` 保持上下文：
-
-```
-1. acp_chat(prompt: "分析测试覆盖率", cwd: "/project")
-   → completed, session_id: "codex:thread-1"
-2. acp_chat(prompt: "为未覆盖分支添加测试", session_id: "codex:thread-1")
-   → completed
-3. acp_chat(prompt: "再跑一次确认", session_id: "codex:thread-1")
-   → completed
-4. acp_close(session_id: "codex:thread-1")
+```text
+acp_chat(prompt, cwd?)
+  → running → 记下双 ID → 循环 acp_progress
+  → permission_required → acp_respond → 再等
+  → completed | error | interrupted → 用结果
+可选：acp_session_info → set_mode / set_config
+可选：同 session 再 acp_chat
+收工：acp_close(session_id)
 ```
 
-`session_id` 固定采用 `<agent_type>:<agent_session_id>`，只切分第一个冒号，因此 agent 原始 ID 可以继续包含冒号。续会话只按该限定 ID 找回原会话；此时传入的 `agent_type` 和 `cwd` 会被忽略。
+- **`acp_progress` 是通用只读查询**，不只服务于 running 轮询。任意对话中只要有活跃 `session_id`，都可调用：
+  - 会话现在是 idle / running / 等权限 / 已结束？
+  - 当前或最近一轮的 `agent_text` / `reasoning` / `tool_calls` / `plan` / `usage` 等
+  - 是否出现 `permission_required`（含 `request_id`）
+  - 只传 `session_id`：看「当前或最近一轮」；加上 `turn_id`：确认仍是那一轮（不匹配则 `turn mismatch`，不改会话状态）
+- `running` 后去干别的之前，必须先留下可复查的 `session_id`/`turn_id`（todo 等）
+- 轮询不必极高频；复杂任务按分钟级间隔即可
+- 要停一轮用 `acp_interrupt`，**不要**用 `acp_close` 当中断
+- 终态结果会留到该 session **下一次成功 chat** 之前，可用 `acp_progress` 再读
 
-同一 session 上不能并发发 prompt——如果 session 正在执行（状态为 prompting），再次调用 `acp_chat` 会返回 `session busy` 错误。需要先 `acp_interrupt(session_id, turn_id)`，或等 `acp_progress(session_id, turn_id)` 返回 completed。
+## 历史与清理
 
-## 会话探索
+- 活跃会话不会自己消失；不用了就 `acp_close`
+- 活跃数有上限（默认 10）；满了先 close 闲置会话，再 new/load/resume/fork
+- 已在活跃列表的 ID：直接 chat，不要 load/resume
+- 删除：`acp_close`（若活跃）→ `acp_delete_session`
 
-首次 chat 后建议调 `acp_session_info` 了解 agent 能力：
-- `config_options` — 可配置项及当前值（model、reasoning_effort）
-- `available_commands` — 支持的 slash 命令（/plan、/research 等）
-- `current_mode` — 当前权限模式
+## 常见错误
 
-## 资源清理
+| 错误 / 现象 | 做法 |
+|-------------|------|
+| `session not found` | 查 `acp_sessions` 或 `acp_list_history` |
+| `session busy` | `acp_progress` 等到终态，或 `acp_interrupt` |
+| `session is active; close it before deleting` | 先 close |
+| `session already active` | 别 load；直接用该 ID chat |
+| `session limit reached...` | close 不用的会话 |
+| `turn_id is required` / `turn mismatch` | 用最近 chat/progress/列表里的 turn_id |
+| `turn is not interruptible` | 已是终态，直接读结果 |
+| permission 未决时又 chat | 先 `acp_respond` |
 
-- 任务完成后调 `acp_close` 释放 session
-- Session 不会因空闲或容量压力被自动淘汰，只在用户关闭、agent 实例退出或 bridge 退出时移除
-- 默认最多保留 10 个活跃 Session；达到上限后新建、加载、恢复和分支会被拒绝，已有 Session 不受影响
-- `acp_sessions()` 不分页，会返回当前全部活跃 Session
-- `acp_interrupt` 只中断匹配 `turn_id` 的当前 turn，session 保持存活可继续使用
+## Red Flags
 
-## Common Mistakes
-
-| 错误 | 原因 | 解决 |
-|------|------|------|
-| session not found | ID 错误、用户已关闭或对应 agent 已退出 | `acp_sessions` 查活跃列表 |
-| session busy | 已有 turn 在执行 | 先 `acp_interrupt` 或等 `acp_progress` |
-| turn mismatch | turn_id 不是当前 turn | 使用最近一次 `acp_chat` 返回的 turn_id |
-| waiting for permission | 处于权限等待 | 调 `acp_respond` 而非 `acp_chat` |
-| running 后遗忘 | 没建 todo | 收到 running 必须立即建 todo |
-| 并发 prompt | 同 session 已有 turn | 一个 session 同时只能有一个活跃 turn |
+- 拿到 `running` 没存 `turn_id` 就切换上下文
+- 对忙碌 session 连发 chat
+- 对活跃 ID delete / 对活跃 ID load
+- 把一次等待超时当成任务失败或已取消
